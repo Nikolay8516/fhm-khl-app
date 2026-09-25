@@ -76,8 +76,8 @@ jobs:
                   applicationId = "com.fhm.khlstyle"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 2
+                  versionName = "1.1"
               }
 
               buildTypes {
@@ -139,7 +139,14 @@ jobs:
           cat << 'EOF' > app/src/main/java/com/fhm/khlstyle/MainActivity.kt
           package com.fhm.khlstyle
 
+          import android.annotation.SuppressLint
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Context
           import android.os.Bundle
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.widget.Toast
           import androidx.activity.ComponentActivity
           import androidx.activity.compose.setContent
           import androidx.compose.foundation.background
@@ -152,9 +159,11 @@ jobs:
           import androidx.compose.foundation.shape.CircleShape
           import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.Code
+          import androidx.compose.material.icons.filled.ContentCopy
           import androidx.compose.material.icons.filled.EmojiEvents
           import androidx.compose.material.icons.filled.FormatListNumbered
-          import androidx.compose.material.icons.filled.Newspaper
+          import androidx.compose.material.icons.filled.Public
           import androidx.compose.material.icons.filled.Refresh
           import androidx.compose.material.icons.filled.SportsHockey
           import androidx.compose.material3.*
@@ -163,126 +172,306 @@ jobs:
           import androidx.compose.ui.Modifier
           import androidx.compose.ui.draw.clip
           import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontFamily
           import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.text.style.TextAlign
           import androidx.compose.ui.text.style.TextOverflow
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
+          import androidx.compose.ui.viewinterop.AndroidView
           import kotlinx.coroutines.Dispatchers
           import kotlinx.coroutines.launch
+          import kotlinx.coroutines.suspendCancellableCoroutine
           import kotlinx.coroutines.withContext
+          import kotlinx.coroutines.withTimeoutOrNull
+          import org.json.JSONTokener
           import org.jsoup.Jsoup
+          import org.jsoup.nodes.Document
+          import kotlin.coroutines.resume
 
+          // --- МОДЕЛИ ДАННЫХ ---
           data class HockeyMatch(
               val id: String,
               val homeTeam: String,
               val awayTeam: String,
-              val homeScore: Int?,
-              val awayScore: Int?,
-              val periodScores: String,
-              val date: String,
+              val scoreText: String,
+              val infoLine: String,
               val status: String,
-              val arena: String,
-              val protocolEvents: List<String>
+              val rawDetails: String
           )
 
-          data class StandingRow(
-              val rank: Int,
-              val team: String,
-              val games: Int,
-              val wins: Int,
-              val losses: Int,
-              val goalsDiff: String,
-              val points: Int
-          )
-
-          data class PlayerStat(
-              val rank: Int,
-              val name: String,
-              val team: String,
-              val games: Int,
-              val goals: Int,
-              val assists: Int,
-              val points: Int
-          )
-
-          data class NewsItem(
+          data class ParsedTable(
               val title: String,
-              val date: String,
-              val url: String
+              val headers: List<String>,
+              val rows: List<List<String>>
           )
 
-          object FhmParser {
-              private const val BASE_URL = "https://fhmoscow.com"
+          data class TournamentPageData(
+              val url: String,
+              val tournamentTitle: String,
+              val matches: List<HockeyMatch>,
+              val tables: List<ParsedTable>,
+              val playerRows: List<List<String>>,
+              val diagnosticReport: String
+          )
 
-              suspend fun fetchLiveSiteData(birthYear: String, group: String): Triple<List<HockeyMatch>, List<StandingRow>, List<NewsItem>> {
-                  return withContext(Dispatchers.IO) {
-                      val parsedNews = mutableListOf<NewsItem>()
+          // --- ДВУХСТУПЕНЧАТЫЙ ПАРСЕР FHMOSCOW.COM (JSOUP + WEBVIEW JS RENDERER) ---
+          object FhmTournamentParser {
+
+              private val SCORE_REGEX = Regex("""(\d+)\s*[:\-]\s*(\d+)""")
+
+              suspend fun loadTournament(
+                  context: Context,
+                  tournamentId: String,
+                  tabIndex: Int
+              ): TournamentPageData {
+                  val targetUrl = "https://fhmoscow.com/tournament/$tournamentId?tournament-tab=$tabIndex"
+
+                  // Шаг 1: Пробуем быстрый прямой Jsoup-запрос
+                  var doc: Document? = withContext(Dispatchers.IO) {
                       try {
-                          val doc = Jsoup.connect(BASE_URL)
-                              .userAgent("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36")
-                              .timeout(10000)
+                          Jsoup.connect(targetUrl)
+                              .userAgent("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+                              .timeout(8000)
                               .get()
+                      } catch (e: Exception) {
+                          null
+                      }
+                  }
 
-                          val links = doc.select("a[href]")
-                          for (el in links) {
-                              val text = el.text().trim()
-                              val href = el.attr("abs:href")
-                              if (text.length > 25 && (href.contains("news") || href.contains("article") || href.contains("match"))) {
-                                  if (parsedNews.none { it.title == text } && parsedNews.size < 12) {
-                                      parsedNews.add(NewsItem(title = text, date = "fhmoscow.com", url = href))
+                  val jsoupTablesCount = doc?.select("table tr")?.size ?: 0
+                  var usedWebView = false
+
+                  // Шаг 2: Если страница рендерится через JS (пустой каркас), запускаем невидимый WebView
+                  if (doc == null || jsoupTablesCount < 2) {
+                      val renderedHtml = fetchRenderedHtmlViaWebView(context, targetUrl)
+                      if (renderedHtml.isNotBlank()) {
+                          doc = Jsoup.parse(renderedHtml, targetUrl)
+                          usedWebView = true
+                      }
+                  }
+
+                  if (doc == null) {
+                      return TournamentPageData(
+                          url = targetUrl,
+                          tournamentTitle = "Ошибка соединения с fhmoscow.com",
+                          matches = emptyList(),
+                          tables = emptyList(),
+                          playerRows = emptyList(),
+                          diagnosticReport = "Не удалось загрузить страницу $targetUrl. Проверьте подключение к интернету."
+                      )
+                  }
+
+                  return parseDomDocument(doc, targetUrl, usedWebView)
+              }
+
+              @SuppressLint("SetJavaScriptEnabled")
+              private suspend fun fetchRenderedHtmlViaWebView(context: Context, url: String): String {
+                  return withContext(Dispatchers.Main) {
+                      withTimeoutOrNull(14000L) {
+                          suspendCancellableCoroutine { cont ->
+                              val webView = WebView(context)
+                              webView.settings.javaScriptEnabled = true
+                              webView.settings.domStorageEnabled = true
+                              webView.settings.userAgentString =
+                                  "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+
+                              var finished = false
+
+                              webView.webViewClient = object : WebViewClient() {
+                                  override fun onPageFinished(view: WebView?, loadedUrl: String?) {
+                                      if (finished) return
+                                      // Ждем 2.8 секунды, чтобы AJAX/JS скрипты сайта ФХМ догрузили таблицы
+                                      webView.postDelayed({
+                                          if (!finished && cont.isActive) {
+                                              finished = true
+                                              webView.evaluateJavascript(
+                                                  "(function() { return document.documentElement.outerHTML; })();"
+                                              ) { rawJson ->
+                                                  val html = try {
+                                                      JSONTokener(rawJson).nextValue()?.toString() ?: ""
+                                                  } catch (e: Exception) {
+                                                      ""
+                                                  }
+                                                  webView.destroy()
+                                                  if (cont.isActive) cont.resume(html)
+                                              }
+                                          }
+                                      }, 2800L)
                                   }
                               }
-                          }
-                          if (parsedNews.isEmpty()) {
-                              parsedNews.add(NewsItem(title = "Сайт ФХМ загружен (${doc.title()})", date = "Статус: ОК", url = BASE_URL))
-                          }
-                      } catch (e: Exception) {
-                          parsedNews.add(NewsItem(title = "Офлайн-режим: ${e.localizedMessage ?: "ошибка сети"}", date = "Проверка связи", url = BASE_URL))
-                      }
 
-                      Triple(getSampleMatchesForYear(birthYear, group), getSampleStandingsForYear(birthYear, group), parsedNews)
+                              cont.invokeOnCancellation {
+                                  webView.stopLoading()
+                                  webView.destroy()
+                              }
+
+                              webView.loadUrl(url)
+                          }
+                      } ?: ""
                   }
               }
 
-              private fun getSampleMatchesForYear(year: String, group: String): List<HockeyMatch> {
-                  return listOf(
-                      HockeyMatch("1", "ЦСКА ($year)", "Спартак ($year)", 4, 3, "1:1, 2:0, 1:2", "Сегодня • Первенство Москвы ($group)", "ОКОНЧЕН", "ЛДС ЦСКА",
-                          listOf("04:12 — 1:0 ЦСКА (Иванов А.)", "14:50 — 1:1 Спартак (Смирнов К.)", "25:10 — 2:1 ЦСКА (Соколов Д.)", "38:02 — 3:1 ЦСКА (Иванов А.)", "44:19 — 3:2 Спартак (Волков М.)", "51:40 — 4:2 ЦСКА (Кузнецов Р.)", "58:55 — 4:3 Спартак (Смирнов К.)")),
-                      HockeyMatch("2", "Динамо ($year)", "Крылья Советов ($year)", 2, 2, "1:0, 1:2, 0:0", "Сегодня • Первенство Москвы ($group)", "3-й ПЕРИОД", "ЛД «Арктика»",
-                          listOf("08:30 — 1:0 Динамо (Федоров Н.)", "22:15 — 1:1 Крылья Советов (Орлов В.)", "31:00 — 2:1 Динамо (Алексеев Т.)", "39:45 — 2:2 Крылья Советов (Макаров П.)")),
-                      HockeyMatch("3", "Академия Михайлова ($year)", "Русь ($year)", null, null, "Превью матча", "Завтра • Первенство Москвы ($group)", "13:00", "ЛД «Центральный»",
-                          listOf("Матч еще не начался.")),
-                      HockeyMatch("4", "Белые Медведи ($year)", "Локомотив-2004 ($year)", 1, 5, "0:2, 1:1, 0:2", "Вчера • Первенство Москвы ($group)", "ОКОНЧЕН", "ЛД «Белые Медведи»",
-                          listOf("03:11 — 0:1 Локомотив (Громов А.)", "17:20 — 0:2 Локомотив (Белов И.)", "29:05 — 1:2 Белые Медведи (Захаров С.)", "35:44 — 1:3 Локомотив (Громов А.)", "48:12 — 1:4 Локомотив (Титов М.)", "56:01 — 1:5 Локомотив (Козлов Д.)"))
-                  )
-              }
+              private fun parseDomDocument(
+                  doc: Document,
+                  url: String,
+                  usedWebView: Boolean
+              ): TournamentPageData {
+                  val h1 = doc.select("h1, h2, .tournament-title, .page-title, .title").firstOrNull()?.text()?.trim()
+                  val tournamentTitle = if (!h1.isNullOrBlank()) h1 else doc.title().ifBlank { "Турнир ФХМ" }
 
-              private fun getSampleStandingsForYear(year: String, group: String): List<StandingRow> {
-                  return listOf(
-                      StandingRow(1, "ЦСКА ($year)", 22, 19, 3, "112-41", 38),
-                      StandingRow(2, "Динамо ($year)", 22, 17, 5, "98-48", 34),
-                      StandingRow(3, "Спартак ($year)", 22, 16, 6, "94-52", 32),
-                      StandingRow(4, "Локомотив ($year)", 22, 15, 7, "89-55", 30),
-                      StandingRow(5, "Академия Михайлова", 22, 12, 10, "76-68", 24),
-                      StandingRow(6, "Крылья Советов", 22, 10, 12, "65-72", 20),
-                      StandingRow(7, "Русь ($group)", 22, 8, 14, "54-81", 16),
-                      StandingRow(8, "Белые Медведи", 22, 5, 17, "43-95", 10)
-                  )
-              }
+                  val parsedTables = mutableListOf<ParsedTable>()
+                  val extractedMatches = mutableListOf<HockeyMatch>()
+                  val extractedPlayers = mutableListOf<List<String>>()
 
-              fun getSamplePlayers(year: String): List<PlayerStat> {
-                  return listOf(
-                      PlayerStat(1, "Иванов Александр", "ЦСКА ($year)", 22, 24, 21, 45),
-                      PlayerStat(2, "Смирнов Кирилл", "Спартак ($year)", 22, 21, 19, 40),
-                      PlayerStat(3, "Федоров Никита", "Динамо ($year)", 21, 16, 22, 38),
-                      PlayerStat(4, "Громов Артем", "Локомотив ($year)", 22, 18, 15, 33),
-                      PlayerStat(5, "Орлов Владислав", "Крылья Советов", 20, 14, 16, 30),
-                      PlayerStat(6, "Соколов Дмитрий", "ЦСКА ($year)", 22, 12, 17, 29)
+                  // 1. Универсальный разбор всех HTML-таблиц <table> на странице
+                  val tables = doc.select("table")
+                  tables.forEachIndexed { idx, table ->
+                      val headers = table.select("thead th, thead td, tr:first-child th").map { it.text().trim() }
+                          .filter { it.isNotEmpty() }
+
+                      val bodyRows = mutableListOf<List<String>>()
+                      val trs = table.select("tbody tr").ifEmpty { table.select("tr") }
+
+                      trs.forEach { tr ->
+                          val cells = tr.select("td").map { it.text().trim() }
+                          if (cells.size >= 2 && cells.any { it.isNotBlank() }) {
+                              bodyRows.add(cells)
+
+                              val rowJoined = cells.joinToString(" | ")
+                              val scoreMatch = SCORE_REGEX.find(rowJoined)
+
+                              // Если строка похожа на матч (содержит счет или время)
+                              if (scoreMatch != null && cells.size in 3..8 && !headers.any { it.equals("И", true) || it.equals("О", true) }) {
+                                  val nonScoreCells = cells.filter { !SCORE_REGEX.containsMatchIn(it) && it.length > 2 }
+                                  val home = nonScoreCells.getOrNull(0) ?: cells.first()
+                                  val away = nonScoreCells.getOrNull(1) ?: cells.last()
+                                  extractedMatches.add(
+                                      HockeyMatch(
+                                          id = "tbl_${idx}_${bodyRows.size}",
+                                          homeTeam = home,
+                                          awayTeam = away,
+                                          scoreText = scoreMatch.value,
+                                          infoLine = cells.firstOrNull() ?: "Турнир ФХМ",
+                                          status = "МАТЧ",
+                                          rawDetails = rowJoined
+                                      )
+                                  )
+                              }
+
+                              // Если таблица похожа на статистику игроков (ФИО + очки/голы)
+                              val headerString = headers.joinToString(" ").lowercase()
+                              if (headerString.contains("игрок") || headerString.contains("бомбардир") || headerString.contains("фио")) {
+                                  extractedPlayers.add(cells)
+                              }
+                          }
+                      }
+
+                      if (bodyRows.isNotEmpty()) {
+                          val prevTitle = table.previousElementSibling()?.text()?.trim()?.take(60)
+                          val tableName = if (!prevTitle.isNullOrBlank()) prevTitle else "Таблица #${idx + 1}"
+                          parsedTables.add(
+                              ParsedTable(
+                                  title = tableName,
+                                  headers = headers,
+                                  rows = bodyRows
+                              )
+                          )
+                      }
+                  }
+
+                  // 2. Поиск карточек матчей в верстке (div/a с классами match, game, calendar, event)
+                  val matchBlocks = doc.select("[class*=match], [class*=game], [class*=event], a[href*=match], a[href*=game], a[href*=protocol]")
+                  matchBlocks.forEachIndexed { idx, el ->
+                      val text = el.text().trim()
+                      if (text.length in 10..180) {
+                          val scoreMatch = SCORE_REGEX.find(text)
+                          val teamEls = el.select("[class*=team], [class*=name], [class*=club], span, div")
+                              .map { it.ownText().trim() }
+                              .filter { it.length in 3..35 && !it.all { ch -> ch.isDigit() } }
+                              .distinct()
+
+                          if (teamEls.size >= 2) {
+                              val score = scoreMatch?.value ?: "VS"
+                              val home = teamEls[0]
+                              val away = teamEls[1]
+                              if (extractedMatches.none { it.homeTeam == home && it.awayTeam == away && it.scoreText == score }) {
+                                  extractedMatches.add(
+                                      HockeyMatch(
+                                          id = "blk_$idx",
+                                          homeTeam = home,
+                                          awayTeam = away,
+                                          scoreText = score,
+                                          infoLine = "ФХМ • $tournamentTitle",
+                                          status = if (score == "VS") "РАСПИСАНИЕ" else "РЕЗУЛЬТАТ",
+                                          rawDetails = text
+                                      )
+                                  )
+                              }
+                          }
+                      }
+                  }
+
+                  // 3. Формируем подробный диагностический отчет о DOM-структуре страницы
+                  val allClasses = doc.select("*[class]")
+                      .flatMap { it.classNames() }
+                      .groupingBy { it }
+                      .eachCount()
+                      .entries
+                      .sortedByDescending { it.value }
+                      .take(30)
+                      .joinToString(", ") { "${it.key}(${it.value})" }
+
+                  val tabLinks = doc.select("a[href*=tournament-tab], [class*=tab]")
+                      .map { "${it.text().trim()} -> ${it.attr("href")}" }
+                      .filter { it.length > 5 }
+                      .distinct()
+                      .take(15)
+                      .joinToString("\n")
+
+                  val sampleTextBlocks = doc.select("table, [class*=table], [class*=match], [class*=stand], main, .content")
+                      .map { "${it.tagName()}.${it.className()}: ${it.text().take(120)}" }
+                      .filter { it.length > 15 }
+                      .take(12)
+                      .joinToString("\n---\n")
+
+                  val report = buildString {
+                      appendLine("=== ОТЧЕТ ПАРСЕРА FHMOSCOW.COM ===")
+                      appendLine("URL: $url")
+                      appendLine("Режим загрузки: ${if (usedWebView) "WebView (JS + AJAX выполнен)" else "Прямой Jsoup"}")
+                      appendLine("Заголовок страницы: ${doc.title()}")
+                      appendLine("Найдено заголовков H1/H2: $h1")
+                      appendLine("Всего HTML-элементов: ${doc.allElements.size}")
+                      appendLine("Найдено таблиц <table>: ${parsedTables.size}")
+                      appendLine("Найдено карточек/строк матчей: ${extractedMatches.size}")
+                      appendLine("\n--- ВКЛАДКИ ТУРНИРА НА СТРАНИЦЕ ---")
+                      appendLine(tabLinks.ifBlank { "Не обнаружены" })
+                      appendLine("\n--- ТОП CSS-КЛАССОВ СТРАНИЦЫ ---")
+                      appendLine(allClasses)
+                      parsedTables.forEachIndexed { i, t ->
+                          appendLine("\n--- Таблица #${i + 1}: ${t.title} ---")
+                          appendLine("Шапка: ${t.headers.joinToString(" | ")}")
+                          t.rows.take(3).forEach { r ->
+                              appendLine("Строка: ${r.joinToString(" | ")}")
+                          }
+                      }
+                      appendLine("\n--- ФРАГМЕНТЫ БЛОКОВ ДАННЫХ ---")
+                      appendLine(sampleTextBlocks)
+                  }
+
+                  return TournamentPageData(
+                      url = url,
+                      tournamentTitle = tournamentTitle,
+                      matches = extractedMatches,
+                      tables = parsedTables,
+                      playerRows = extractedPlayers,
+                      diagnosticReport = report
                   )
               }
           }
 
+          // --- ЦВЕТОВАЯ ПАЛИТРА В СТИЛЕ КХЛ ---
           val KhlBgDark = Color(0xFF0B101B)
           val KhlCardDark = Color(0xFF161F30)
           val KhlAccentRed = Color(0xFFE30613)
@@ -309,33 +498,29 @@ jobs:
 
           @Composable
           fun FhmKhlApp() {
-              var selectedTab by remember { mutableIntStateOf(0) }
-              var selectedYear by remember { mutableStateOf("2013 г.р.") }
-              var selectedGroup by remember { mutableStateOf("Группа А") }
-
-              val years = listOf("2009 г.р.", "2010 г.р.", "2011 г.р.", "2012 г.р.", "2013 г.р.", "2014 г.р.", "2015 г.р.")
-              val groups = listOf("Группа А", "Группа Б", "Группа В")
-
-              var matches by remember { mutableStateOf<List<HockeyMatch>>(emptyList()) }
-              var standings by remember { mutableStateOf<List<StandingRow>>(emptyList()) }
-              var news by remember { mutableStateOf<List<NewsItem>>(emptyList()) }
-              var isLoading by remember { mutableStateOf(true) }
-              var selectedMatchForProtocol by remember { mutableStateOf<HockeyMatch?>(null) }
-
+              val context = LocalContext.current
               val scope = rememberCoroutineScope()
 
-              fun loadData() {
+              var bottomTab by remember { mutableIntStateOf(1) } // Сразу открываем Таблицу (как в tournament-tab=1)
+              var tournamentId by remember { mutableStateOf("54") }
+              var siteTabIndex by remember { mutableIntStateOf(1) }
+
+              var pageData by remember { mutableStateOf<TournamentPageData?>(null) }
+              var isLoading by remember { mutableStateOf(true) }
+              var selectedMatch by remember { mutableStateOf<HockeyMatch?>(null) }
+              var showIdDialog by remember { mutableStateOf(false) }
+
+              fun reload() {
                   scope.launch {
                       isLoading = true
-                      val (m, s, n) = FhmParser.fetchLiveSiteData(selectedYear, selectedGroup)
-                      matches = m
-                      standings = s
-                      news = n
+                      pageData = FhmTournamentParser.loadTournament(context, tournamentId, siteTabIndex)
                       isLoading = false
                   }
               }
 
-              LaunchedEffect(selectedYear, selectedGroup) { loadData() }
+              LaunchedEffect(tournamentId, siteTabIndex) {
+                  reload()
+              }
 
               Scaffold(
                   containerColor = KhlBgDark,
@@ -344,108 +529,196 @@ jobs:
                           modifier = Modifier
                               .fillMaxWidth()
                               .background(KhlCardDark)
-                              .padding(top = 12.dp, bottom = 8.dp)
+                              .padding(top = 10.dp, bottom = 8.dp)
                       ) {
                           Row(
                               modifier = Modifier
                                   .fillMaxWidth()
-                                  .padding(horizontal = 16.dp),
+                                  .padding(horizontal = 14.dp),
                               horizontalArrangement = Arrangement.SpaceBetween,
                               verticalAlignment = Alignment.CenterVertically
                           ) {
-                              Row(verticalAlignment = Alignment.CenterVertically) {
-                                  Box(modifier = Modifier.size(10.dp).clip(CircleShape).background(KhlAccentRed))
-                                  Spacer(modifier = Modifier.width(8.dp))
-                                  Text("ФХМ • МАТЧ-ЦЕНТР", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Black)
+                              Column(modifier = Modifier.weight(1f)) {
+                                  Row(verticalAlignment = Alignment.CenterVertically) {
+                                      Box(modifier = Modifier.size(9.dp).clip(CircleShape).background(KhlAccentRed))
+                                      Spacer(modifier = Modifier.width(8.dp))
+                                      Text(
+                                          text = "ФХМ • ТУРНИР #$tournamentId",
+                                          color = KhlIceBlue,
+                                          fontSize = 12.sp,
+                                          fontWeight = FontWeight.Bold,
+                                          modifier = Modifier.clickable { showIdDialog = true }
+                                      )
+                                  }
+                                  Text(
+                                      text = pageData?.tournamentTitle ?: "Загрузка fhmoscow.com/tournament/$tournamentId...",
+                                      color = Color.White,
+                                      fontSize = 15.sp,
+                                      fontWeight = FontWeight.Black,
+                                      maxLines = 1,
+                                      overflow = TextOverflow.Ellipsis
+                                  )
                               }
-                              IconButton(onClick = { loadData() }) {
+                              IconButton(onClick = { reload() }) {
                                   Icon(Icons.Default.Refresh, contentDescription = "Обновить", tint = Color.White)
                               }
                           }
 
+                          // Переключатель параметров ?tournament-tab=1..5 на сайте ФХМ
                           Row(
                               modifier = Modifier
                                   .fillMaxWidth()
                                   .horizontalScroll(rememberScrollState())
-                                  .padding(horizontal = 12.dp, vertical = 4.dp),
+                                  .padding(horizontal = 12.dp, vertical = 6.dp),
                               horizontalArrangement = Arrangement.spacedBy(8.dp)
                           ) {
-                              years.forEach { year ->
-                                  val isSelected = year == selectedYear
+                              val siteTabs = listOf(
+                                  1 to "Раздел 1 (tab=1)",
+                                  2 to "Раздел 2 (tab=2)",
+                                  3 to "Раздел 3 (tab=3)",
+                                  4 to "Раздел 4 (tab=4)"
+                              )
+                              siteTabs.forEach { (idx, label) ->
+                                  val active = siteTabIndex == idx
                                   Box(
                                       modifier = Modifier
                                           .clip(RoundedCornerShape(16.dp))
-                                          .background(if (isSelected) KhlAccentRed else KhlBgDark)
-                                          .clickable { selectedYear = year }
+                                          .background(if (active) KhlAccentRed else KhlBgDark)
+                                          .clickable { siteTabIndex = idx }
                                           .padding(horizontal = 12.dp, vertical = 6.dp)
                                   ) {
-                                      Text(year, color = if (isSelected) Color.White else KhlTextGray, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                                      Text(
+                                          text = label,
+                                          color = if (active) Color.White else KhlTextGray,
+                                          fontSize = 12.sp,
+                                          fontWeight = FontWeight.Bold
+                                      )
                                   }
                               }
-                          }
 
-                          Row(
-                              modifier = Modifier
-                                  .fillMaxWidth()
-                                  .padding(horizontal = 12.dp, vertical = 4.dp),
-                              horizontalArrangement = Arrangement.spacedBy(8.dp)
-                          ) {
-                              groups.forEach { group ->
-                                  val isSelected = group == selectedGroup
-                                  Box(
-                                      modifier = Modifier
-                                          .clip(RoundedCornerShape(8.dp))
-                                          .background(if (isSelected) KhlIceBlue.copy(alpha = 0.25f) else Color.Transparent)
-                                          .clickable { selectedGroup = group }
-                                          .padding(horizontal = 12.dp, vertical = 4.dp)
-                                  ) {
-                                      Text(group, color = if (isSelected) KhlIceBlue else KhlTextGray, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                                  }
+                              Box(
+                                  modifier = Modifier
+                                      .clip(RoundedCornerShape(16.dp))
+                                      .background(KhlIceBlue.copy(alpha = 0.2f))
+                                      .clickable { showIdDialog = true }
+                                      .padding(horizontal = 12.dp, vertical = 6.dp)
+                              ) {
+                                  Text(
+                                      text = "Сменить ID ($tournamentId)",
+                                      color = KhlIceBlue,
+                                      fontSize = 12.sp,
+                                      fontWeight = FontWeight.Bold
+                                  )
                               }
                           }
                       }
                   },
                   bottomBar = {
                       NavigationBar(containerColor = KhlCardDark) {
-                          NavigationBarItem(selected = selectedTab == 0, onClick = { selectedTab = 0 }, icon = { Icon(Icons.Default.SportsHockey, null) }, label = { Text("Матчи") })
-                          NavigationBarItem(selected = selectedTab == 1, onClick = { selectedTab = 1 }, icon = { Icon(Icons.Default.FormatListNumbered, null) }, label = { Text("Таблица") })
-                          NavigationBarItem(selected = selectedTab == 2, onClick = { selectedTab = 2 }, icon = { Icon(Icons.Default.EmojiEvents, null) }, label = { Text("Игроки") })
-                          NavigationBarItem(selected = selectedTab == 3, onClick = { selectedTab = 3 }, icon = { Icon(Icons.Default.Newspaper, null) }, label = { Text("ФХМ Live") })
+                          NavigationBarItem(
+                              selected = bottomTab == 0,
+                              onClick = { bottomTab = 0 },
+                              icon = { Icon(Icons.Default.SportsHockey, null) },
+                              label = { Text("Матчи (${pageData?.matches?.size ?: 0})") }
+                          )
+                          NavigationBarItem(
+                              selected = bottomTab == 1,
+                              onClick = { bottomTab = 1 },
+                              icon = { Icon(Icons.Default.FormatListNumbered, null) },
+                              label = { Text("Таблицы (${pageData?.tables?.size ?: 0})") }
+                          )
+                          NavigationBarItem(
+                              selected = bottomTab == 2,
+                              onClick = { bottomTab = 2 },
+                              icon = { Icon(Icons.Default.EmojiEvents, null) },
+                              label = { Text("Игроки") }
+                          )
+                          NavigationBarItem(
+                              selected = bottomTab == 3,
+                              onClick = { bottomTab = 3 },
+                              icon = { Icon(Icons.Default.Code, null) },
+                              label = { Text("Веб / DOM") }
+                          )
                       }
                   }
               ) { innerPadding ->
-                  Box(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
+                  Box(
+                      modifier = Modifier
+                          .fillMaxSize()
+                          .padding(innerPadding)
+                  ) {
                       if (isLoading) {
-                          CircularProgressIndicator(color = KhlAccentRed, modifier = Modifier.align(Alignment.Center))
+                          Column(
+                              modifier = Modifier.align(Alignment.Center),
+                              horizontalAlignment = Alignment.CenterHorizontally
+                          ) {
+                              CircularProgressIndicator(color = KhlAccentRed)
+                              Spacer(modifier = Modifier.height(12.dp))
+                              Text(
+                                  text = "Чтение fhmoscow.com/tournament/$tournamentId?tournament-tab=$siteTabIndex...",
+                                  color = KhlTextGray,
+                                  fontSize = 12.sp,
+                                  textAlign = TextAlign.Center,
+                                  modifier = Modifier.padding(horizontal = 24.dp)
+                              )
+                          }
                       } else {
-                          when (selectedTab) {
-                              0 -> MatchesScreen(matches) { selectedMatchForProtocol = it }
-                              1 -> StandingsScreen(standings)
-                              2 -> PlayersScreen(FhmParser.getSamplePlayers(selectedYear))
-                              3 -> NewsParserScreen(news)
+                          val data = pageData
+                          if (data != null) {
+                              when (bottomTab) {
+                                  0 -> LiveMatchesScreen(data, onMatchClick = { selectedMatch = it })
+                                  1 -> LiveTablesScreen(data)
+                                  2 -> LivePlayersScreen(data)
+                                  3 -> WebAndDomScreen(data)
+                              }
                           }
                       }
                   }
               }
 
-              selectedMatchForProtocol?.let { match ->
+              // Диалог смены ID турнира
+              if (showIdDialog) {
+                  var tempId by remember { mutableStateOf(tournamentId) }
                   AlertDialog(
-                      onDismissRequest = { selectedMatchForProtocol = null },
+                      onDismissRequest = { showIdDialog = false },
+                      containerColor = KhlCardDark,
+                      title = { Text("ID турнира на fhmoscow.com", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold) },
+                      text = {
+                          OutlinedTextField(
+                              value = tempId,
+                              onValueChange = { tempId = it.filter { ch -> ch.isDigit() } },
+                              label = { Text("Например: 54") },
+                              singleLine = true
+                          )
+                      },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              if (tempId.isNotBlank()) tournamentId = tempId
+                              showIdDialog = false
+                          }) {
+                              Text("Загрузить", color = KhlIceBlue)
+                          }
+                      }
+                  )
+              }
+
+              // Детали матча
+              selectedMatch?.let { match ->
+                  AlertDialog(
+                      onDismissRequest = { selectedMatch = null },
                       containerColor = KhlCardDark,
                       title = {
-                          Column {
-                              Text("${match.homeTeam} — ${match.awayTeam}", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                              Text("Периоды: ${match.periodScores} • ${match.arena}", color = KhlIceBlue, fontSize = 12.sp)
-                          }
+                          Text("${match.homeTeam} — ${match.awayTeam}", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                       },
                       text = {
                           Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                              Text("ПРОТОКОЛ МАТЧА:", color = KhlTextGray, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                              match.protocolEvents.forEach { ev -> Text(ev, color = Color.White, fontSize = 13.sp) }
+                              Text("Счет / Статус: ${match.scoreText}", color = KhlIceBlue, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                              Text("Данные из строки ФХМ:", color = KhlTextGray, fontSize = 12.sp)
+                              Text(match.rawDetails, color = Color.White, fontSize = 13.sp)
                           }
                       },
                       confirmButton = {
-                          TextButton(onClick = { selectedMatchForProtocol = null }) {
+                          TextButton(onClick = { selectedMatch = null }) {
                               Text("Закрыть", color = KhlIceBlue)
                           }
                       }
@@ -454,9 +727,21 @@ jobs:
           }
 
           @Composable
-          fun MatchesScreen(matches: List<HockeyMatch>, onMatchClick: (HockeyMatch) -> Unit) {
-              LazyColumn(contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                  items(matches) { match ->
+          fun LiveMatchesScreen(data: TournamentPageData, onMatchClick: (HockeyMatch) -> Unit) {
+              if (data.matches.isEmpty()) {
+                  Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+                      Text(
+                          text = "На вкладке ${data.url} карточки матчей не найдены.\n\nПопробуй переключить «Раздел 2 (tab=2)» или «Раздел 3 (tab=3)» сверху, либо проверь вкладку «Таблицы» и «Веб / DOM».",
+                          color = KhlTextGray,
+                          fontSize = 14.sp,
+                          textAlign = TextAlign.Center
+                      )
+                  }
+                  return
+              }
+
+              LazyColumn(contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                  items(data.matches) { match ->
                       Card(
                           colors = CardDefaults.cardColors(containerColor = KhlCardDark),
                           shape = RoundedCornerShape(14.dp),
@@ -464,22 +749,25 @@ jobs:
                       ) {
                           Column(modifier = Modifier.padding(16.dp)) {
                               Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                  Text(match.date, color = KhlTextGray, fontSize = 11.sp)
-                                  Text(match.status, color = if (match.status.contains("ПЕРИОД")) KhlAccentRed else KhlIceBlue, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                              }
-                              Spacer(modifier = Modifier.height(12.dp))
-                              Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-                                  Text(match.homeTeam, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                                  Box(modifier = Modifier.clip(RoundedCornerShape(8.dp)).background(KhlBgDark).padding(horizontal = 14.dp, vertical = 6.dp)) {
-                                      val scoreText = if (match.homeScore != null) "${match.homeScore} : ${match.awayScore}" else "VS"
-                                      Text(scoreText, color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Black)
-                                  }
-                                  Text(match.awayTeam, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.End, modifier = Modifier.weight(1f))
+                                  Text(match.infoLine, color = KhlTextGray, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                                  Text(match.status, color = KhlIceBlue, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                               }
                               Spacer(modifier = Modifier.height(10.dp))
-                              Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                  Text("Периоды: ${match.periodScores}", color = KhlTextGray, fontSize = 12.sp)
-                                  Text("Протокол ->", color = KhlIceBlue, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                              Row(
+                                  modifier = Modifier.fillMaxWidth(),
+                                  verticalAlignment = Alignment.CenterVertically,
+                                  horizontalArrangement = Arrangement.SpaceBetween
+                              ) {
+                                  Text(match.homeTeam, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                                  Box(
+                                      modifier = Modifier
+                                          .clip(RoundedCornerShape(8.dp))
+                                          .background(KhlBgDark)
+                                          .padding(horizontal = 12.dp, vertical = 6.dp)
+                                  ) {
+                                      Text(match.scoreText, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Black)
+                                  }
+                                  Text(match.awayTeam, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.End, modifier = Modifier.weight(1f))
                               }
                           }
                       }
@@ -488,29 +776,80 @@ jobs:
           }
 
           @Composable
-          fun StandingsScreen(standings: List<StandingRow>) {
-              LazyColumn(contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                  item {
-                      Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
-                          Text("#", color = KhlTextGray, fontSize = 12.sp, modifier = Modifier.width(28.dp))
-                          Text("Команда", color = KhlTextGray, fontSize = 12.sp, modifier = Modifier.weight(1f))
-                          Text("И", color = KhlTextGray, fontSize = 12.sp, modifier = Modifier.width(30.dp), textAlign = TextAlign.Center)
-                          Text("В", color = KhlTextGray, fontSize = 12.sp, modifier = Modifier.width(30.dp), textAlign = TextAlign.Center)
-                          Text("П", color = KhlTextGray, fontSize = 12.sp, modifier = Modifier.width(30.dp), textAlign = TextAlign.Center)
-                          Text("Ш", color = KhlTextGray, fontSize = 12.sp, modifier = Modifier.width(56.dp), textAlign = TextAlign.Center)
-                          Text("О", color = KhlIceBlue, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.width(34.dp), textAlign = TextAlign.End)
-                      }
+          fun LiveTablesScreen(data: TournamentPageData) {
+              if (data.tables.isEmpty()) {
+                  Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+                      Text(
+                          text = "Таблицы <table> на странице ${data.url} не обнаружены.\n\nПерейди на вкладку «Веб / DOM» внизу и нажми «Скопировать структуру HTML», чтобы посмотреть, в каких тегах сайт отдает данные.",
+                          color = KhlTextGray,
+                          fontSize = 14.sp,
+                          textAlign = TextAlign.Center
+                      )
                   }
-                  items(standings) { row ->
-                      Card(colors = CardDefaults.cardColors(containerColor = KhlCardDark), shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth()) {
-                          Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                              Text(row.rank.toString(), color = if (row.rank <= 3) KhlAccentRed else KhlTextGray, fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.width(28.dp))
-                              Text(row.team, color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                              Text(row.games.toString(), color = KhlTextGray, fontSize = 13.sp, modifier = Modifier.width(30.dp), textAlign = TextAlign.Center)
-                              Text(row.wins.toString(), color = Color.White, fontSize = 13.sp, modifier = Modifier.width(30.dp), textAlign = TextAlign.Center)
-                              Text(row.losses.toString(), color = KhlTextGray, fontSize = 13.sp, modifier = Modifier.width(30.dp), textAlign = TextAlign.Center)
-                              Text(row.goalsDiff, color = KhlTextGray, fontSize = 12.sp, modifier = Modifier.width(56.dp), textAlign = TextAlign.Center)
-                              Text(row.points.toString(), color = KhlIceBlue, fontWeight = FontWeight.Black, fontSize = 14.sp, modifier = Modifier.width(34.dp), textAlign = TextAlign.End)
+                  return
+              }
+
+              LazyColumn(contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                  items(data.tables) { table ->
+                      Card(
+                          colors = CardDefaults.cardColors(containerColor = KhlCardDark),
+                          shape = RoundedCornerShape(12.dp),
+                          modifier = Modifier.fillMaxWidth()
+                      ) {
+                          Column(modifier = Modifier.padding(12.dp)) {
+                              Text(
+                                  text = table.title.uppercase(),
+                                  color = KhlIceBlue,
+                                  fontSize = 13.sp,
+                                  fontWeight = FontWeight.Black,
+                                  modifier = Modifier.padding(bottom = 8.dp)
+                              )
+
+                              val scrollState = rememberScrollState()
+                              Column(modifier = Modifier.horizontalScroll(scrollState)) {
+                                  if (table.headers.isNotEmpty()) {
+                                      Row(
+                                          modifier = Modifier
+                                              .background(KhlBgDark, RoundedCornerShape(6.dp))
+                                              .padding(vertical = 8.dp, horizontal = 8.dp)
+                                      ) {
+                                          table.headers.forEachIndexed { idx, h ->
+                                              val w = if (idx == 1) 170.dp else 46.dp
+                                              Text(
+                                                  text = h,
+                                                  color = KhlTextGray,
+                                                  fontSize = 11.sp,
+                                                  fontWeight = FontWeight.Bold,
+                                                  modifier = Modifier.width(w).padding(horizontal = 4.dp)
+                                              )
+                                          }
+                                      }
+                                      Spacer(modifier = Modifier.height(4.dp))
+                                  }
+
+                                  table.rows.forEachIndexed { rIdx, row ->
+                                      Row(
+                                          modifier = Modifier
+                                              .background(if (rIdx % 2 == 0) Color.Transparent else KhlBgDark.copy(alpha = 0.45f))
+                                              .padding(vertical = 8.dp, horizontal = 8.dp),
+                                          verticalAlignment = Alignment.CenterVertically
+                                      ) {
+                                          row.forEachIndexed { cIdx, cell ->
+                                              val w = if (cIdx == 1) 170.dp else 46.dp
+                                              val isHighlight = cIdx == 0 || cIdx == row.lastIndex
+                                              Text(
+                                                  text = cell,
+                                                  color = if (isHighlight) KhlIceBlue else Color.White,
+                                                  fontWeight = if (cIdx <= 1 || cIdx == row.lastIndex) FontWeight.Bold else FontWeight.Normal,
+                                                  fontSize = 12.sp,
+                                                  maxLines = 1,
+                                                  overflow = TextOverflow.Ellipsis,
+                                                  modifier = Modifier.width(w).padding(horizontal = 4.dp)
+                                              )
+                                          }
+                                      }
+                                  }
+                              }
                           }
                       }
                   }
@@ -518,56 +857,118 @@ jobs:
           }
 
           @Composable
-          fun PlayersScreen(players: List<PlayerStat>) {
+          fun LivePlayersScreen(data: TournamentPageData) {
+              val rows = if (data.playerRows.isNotEmpty()) data.playerRows else data.tables.lastOrNull()?.rows ?: emptyList()
+
+              if (rows.isEmpty()) {
+                  Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+                      Text(
+                          text = "Чтобы загрузить статистику игроков этого турнира, переключи сверху «Раздел 3 (tab=3)» или «Раздел 4 (tab=4)».",
+                          color = KhlTextGray,
+                          fontSize = 14.sp,
+                          textAlign = TextAlign.Center
+                      )
+                  }
+                  return
+              }
+
               LazyColumn(contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                  item {
-                      Text("БОМБАРДИРЫ ПЕРВЕНСТВА МОСКВЫ", color = KhlTextGray, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 4.dp))
-                  }
-                  items(players) { p ->
-                      Card(colors = CardDefaults.cardColors(containerColor = KhlCardDark), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
-                          Row(modifier = Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-                              Column(modifier = Modifier.weight(1f)) {
-                                  Text("${p.rank}. ${p.name}", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                                  Text(p.team, color = KhlIceBlue, fontSize = 12.sp)
-                              }
-                              Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                                  Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                      Text("И", color = KhlTextGray, fontSize = 10.sp)
-                                      Text("${p.games}", color = Color.White, fontSize = 14.sp)
-                                  }
-                                  Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                      Text("Г", color = KhlTextGray, fontSize = 10.sp)
-                                      Text("${p.goals}", color = Color.White, fontSize = 14.sp)
-                                  }
-                                  Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                      Text("П", color = KhlTextGray, fontSize = 10.sp)
-                                      Text("${p.assists}", color = Color.White, fontSize = 14.sp)
-                                  }
-                                  Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                      Text("ОЧКИ", color = KhlAccentRed, fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                                      Text("${p.points}", color = KhlIceBlue, fontSize = 16.sp, fontWeight = FontWeight.Black)
-                                  }
-                              }
-                          }
+                  items(rows) { row ->
+                      Card(
+                          colors = CardDefaults.cardColors(containerColor = KhlCardDark),
+                          shape = RoundedCornerShape(10.dp),
+                          modifier = Modifier.fillMaxWidth()
+                      ) {
+                          Text(
+                              text = row.joinToString("  •  "),
+                              color = Color.White,
+                              fontSize = 13.sp,
+                              modifier = Modifier.padding(12.dp)
+                          )
                       }
                   }
               }
           }
 
+          @SuppressLint("SetJavaScriptEnabled")
           @Composable
-          fun NewsParserScreen(news: List<NewsItem>) {
-              LazyColumn(contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                  item {
-                      Text("ПРЯМОЙ ПАРСИНГ С FHMOSCOW.COM (JSOUP):", color = KhlIceBlue, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+          fun WebAndDomScreen(data: TournamentPageData) {
+              val context = LocalContext.current
+              var showLiveWeb by remember { mutableStateOf(false) }
+
+              Column(modifier = Modifier.fillMaxSize()) {
+                  Row(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .padding(horizontal = 12.dp, vertical = 8.dp),
+                      horizontalArrangement = Arrangement.spacedBy(8.dp)
+                  ) {
+                      Button(
+                          onClick = {
+                              val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                              clipboard.setPrimaryClip(ClipData.newPlainText("FHM_DOM", data.diagnosticReport))
+                              Toast.makeText(context, "Структура скопирована! Вставь её в чат", Toast.LENGTH_LONG).show()
+                          },
+                          colors = ButtonDefaults.buttonColors(containerColor = KhlAccentRed),
+                          modifier = Modifier.weight(1f)
+                      ) {
+                          Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                          Spacer(modifier = Modifier.width(6.dp))
+                          Text("Скопировать DOM", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                      }
+
+                      Button(
+                          onClick = { showLiveWeb = !showLiveWeb },
+                          colors = ButtonDefaults.buttonColors(containerColor = KhlCardDark),
+                          modifier = Modifier.weight(1f)
+                      ) {
+                          Icon(Icons.Default.Public, contentDescription = null, modifier = Modifier.size(16.dp), tint = KhlIceBlue)
+                          Spacer(modifier = Modifier.width(6.dp))
+                          Text(
+                              text = if (showLiveWeb) "Показать отчет" else "Открыть веб-вид",
+                              color = KhlIceBlue,
+                              fontSize = 12.sp,
+                              fontWeight = FontWeight.Bold
+                          )
+                      }
                   }
-                  items(news) { item ->
-                      Card(colors = CardDefaults.cardColors(containerColor = KhlCardDark), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
-                          Column(modifier = Modifier.padding(14.dp)) {
-                              Text(item.date, color = KhlAccentRed, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                              Spacer(modifier = Modifier.height(4.dp))
-                              Text(item.title, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                              Spacer(modifier = Modifier.height(6.dp))
-                              Text(item.url, color = KhlTextGray, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+
+                  if (showLiveWeb) {
+                      AndroidView(
+                          modifier = Modifier.fillMaxSize(),
+                          factory = { ctx ->
+                              WebView(ctx).apply {
+                                  settings.javaScriptEnabled = true
+                                  settings.domStorageEnabled = true
+                                  webViewClient = WebViewClient()
+                                  loadUrl(data.url)
+                              }
+                          },
+                          update = { webView ->
+                              if (webView.url != data.url) {
+                                  webView.loadUrl(data.url)
+                              }
+                          }
+                      )
+                  } else {
+                      LazyColumn(
+                          contentPadding = PaddingValues(12.dp),
+                          modifier = Modifier.fillMaxSize()
+                      ) {
+                          item {
+                              Card(
+                                  colors = CardDefaults.cardColors(containerColor = KhlCardDark),
+                                  shape = RoundedCornerShape(12.dp),
+                                  modifier = Modifier.fillMaxWidth()
+                              ) {
+                                  Text(
+                                      text = data.diagnosticReport,
+                                      color = Color.White,
+                                      fontSize = 11.sp,
+                                      fontFamily = FontFamily.Monospace,
+                                      modifier = Modifier.padding(12.dp)
+                                  )
+                              }
                           }
                       }
                   }
