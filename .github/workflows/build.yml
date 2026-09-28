@@ -77,8 +77,8 @@ jobs:
                   applicationId = "com.fhm.khlstyle"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 20
-                  versionName = "2.0"
+                  versionCode = 21
+                  versionName = "2.1"
               }
 
               buildTypes {
@@ -121,7 +121,7 @@ jobs:
               <application
                   android:allowBackup="false"
                   android:icon="@android:drawable/sym_def_app_icon"
-                  android:label="ФХМ 54 (v2.0)"
+                  android:label="ФХМ 54 (v2.1)"
                   android:supportsRtl="true"
                   android:usesCleartextTraffic="true"
                   android:theme="@android:style/Theme.Material.NoActionBar">
@@ -145,6 +145,8 @@ jobs:
           import android.content.ClipboardManager
           import android.content.Context
           import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
           import android.webkit.WebView
           import android.webkit.WebViewClient
           import android.widget.Toast
@@ -217,7 +219,7 @@ jobs:
           )
 
           object FhmTournamentParser {
-              private val SCORE_REGEX = Regex("""(\d+)\s*[:\-]\s*(\d+)""")
+              private val SCORE_REGEX = Regex("([0-9]+)\\s*[:\\-]\\s*([0-9]+)")
 
               suspend fun loadTournament(
                   context: Context,
@@ -242,7 +244,7 @@ jobs:
 
                   if (doc == null || jsoupTablesCount < 2) {
                       val renderedHtml = fetchRenderedHtmlViaWebView(context, targetUrl)
-                      if (renderedHtml.isNotBlank()) {
+                      if (renderedHtml.isNotEmpty()) {
                           doc = Jsoup.parse(renderedHtml, targetUrl)
                           usedWebView = true
                       }
@@ -265,8 +267,8 @@ jobs:
               @SuppressLint("SetJavaScriptEnabled")
               private suspend fun fetchRenderedHtmlViaWebView(context: Context, url: String): String {
                   return withContext(Dispatchers.Main) {
-                      withTimeoutOrNull(15000L) {
-                          suspendCancellableCoroutine { cont ->
+                      val result: String? = withTimeoutOrNull<String>(15000L) {
+                          suspendCancellableCoroutine<String> { cont ->
                               val webView = WebView(context)
                               webView.settings.javaScriptEnabled = true
                               webView.settings.domStorageEnabled = true
@@ -274,23 +276,26 @@ jobs:
                                   "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
                               var finished = false
+                              val mainHandler = Handler(Looper.getMainLooper())
 
                               webView.webViewClient = object : WebViewClient() {
                                   override fun onPageFinished(view: WebView?, loadedUrl: String?) {
                                       if (finished) return
-                                      webView.postDelayed({
+                                      mainHandler.postDelayed({
                                           if (!finished && cont.isActive) {
                                               finished = true
                                               webView.evaluateJavascript(
                                                   "(function() { return document.documentElement.outerHTML; })();"
                                               ) { rawJson ->
                                                   val html = try {
-                                                      JSONTokener(rawJson).nextValue()?.toString() ?: ""
+                                                      if (rawJson != null) JSONTokener(rawJson).nextValue()?.toString() ?: "" else ""
                                                   } catch (e: Exception) {
                                                       ""
                                                   }
                                                   webView.destroy()
-                                                  if (cont.isActive) cont.resume(html)
+                                                  if (cont.isActive) {
+                                                      cont.resume(html)
+                                                  }
                                               }
                                           }
                                       }, 3000L)
@@ -298,13 +303,15 @@ jobs:
                               }
 
                               cont.invokeOnCancellation {
+                                  mainHandler.removeCallbacksAndMessages(null)
                                   webView.stopLoading()
                                   webView.destroy()
                               }
 
                               webView.loadUrl(url)
                           }
-                      } ?: ""
+                      }
+                      result ?: ""
                   }
               }
 
@@ -313,40 +320,53 @@ jobs:
                   url: String,
                   usedWebView: Boolean
               ): TournamentPageData {
-                  val h1 = doc.select("h1, h2, .tournament-title, .page-title, .title").firstOrNull()?.text()?.trim()
-                  val tournamentTitle = if (!h1.isNullOrBlank()) h1 else doc.title().ifBlank { "Турнир ФХМ #54" }
+                  val h1El = doc.select("h1, h2, .tournament-title, .page-title, .title").firstOrNull()
+                  val h1 = h1El?.text()?.trim() ?: ""
+                  val docTitle = doc.title().trim()
+                  val tournamentTitle = if (h1.isNotEmpty()) h1 else if (docTitle.isNotEmpty()) docTitle else "Турнир ФХМ #54"
 
                   val parsedTables = mutableListOf<ParsedTable>()
                   val extractedMatches = mutableListOf<HockeyMatch>()
                   val extractedPlayers = mutableListOf<List<String>>()
 
                   val tables = doc.select("table")
-                  tables.forEachIndexed { idx, table ->
-                      val headers = table.select("thead th, thead td, tr:first-child th").map { it.text().trim() }
-                          .filter { it.isNotEmpty() }
+                  for (idx in 0 until tables.size) {
+                      val table = tables[idx]
+                      val headerEls = table.select("thead th, thead td, tr:first-child th")
+                      val headers = mutableListOf<String>()
+                      for (hEl in headerEls) {
+                          val t = hEl.text().trim()
+                          if (t.isNotEmpty()) headers.add(t)
+                      }
 
                       val bodyRows = mutableListOf<List<String>>()
-                      val trs = table.select("tbody tr").ifEmpty { table.select("tr") }
+                      val tbodyTrs = table.select("tbody tr")
+                      val trs = if (tbodyTrs.isNotEmpty()) tbodyTrs else table.select("tr")
 
-                      trs.forEach { tr ->
-                          val cells = tr.select("td").map { it.text().trim() }
-                          if (cells.size >= 2 && cells.any { it.isNotBlank() }) {
+                      for (tr in trs) {
+                          val tdEls = tr.select("td")
+                          val cells = mutableListOf<String>()
+                          for (td in tdEls) {
+                              cells.add(td.text().trim())
+                          }
+                          if (cells.size >= 2 && cells.any { it.isNotEmpty() }) {
                               bodyRows.add(cells)
 
                               val rowJoined = cells.joinToString(" | ")
                               val scoreMatch = SCORE_REGEX.find(rowJoined)
+                              val isStandings = headers.any { it.equals("И", true) || it.equals("О", true) }
 
-                              if (scoreMatch != null && cells.size in 3..8 && !headers.any { it.equals("И", true) || it.equals("О", true) }) {
+                              if (scoreMatch != null && cells.size in 3..8 && !isStandings) {
                                   val nonScoreCells = cells.filter { !SCORE_REGEX.containsMatchIn(it) && it.length > 2 }
-                                  val home = nonScoreCells.getOrNull(0) ?: cells.first()
-                                  val away = nonScoreCells.getOrNull(1) ?: cells.last()
+                                  val home = if (nonScoreCells.isNotEmpty()) nonScoreCells[0] else cells[0]
+                                  val away = if (nonScoreCells.size >= 2) nonScoreCells[1] else cells[cells.size - 1]
                                   extractedMatches.add(
                                       HockeyMatch(
                                           id = "tbl_${idx}_${bodyRows.size}",
                                           homeTeam = home,
                                           awayTeam = away,
                                           scoreText = scoreMatch.value,
-                                          infoLine = cells.firstOrNull() ?: "Турнир ФХМ",
+                                          infoLine = cells[0],
                                           status = "МАТЧ",
                                           rawDetails = rowJoined
                                       )
@@ -361,26 +381,31 @@ jobs:
                       }
 
                       if (bodyRows.isNotEmpty()) {
-                          val prevTitle = table.previousElementSibling()?.text()?.trim()?.take(60)
-                          val tableName = if (!prevTitle.isNullOrBlank()) prevTitle else "Таблица #${idx + 1}"
+                          val prevText = table.previousElementSibling()?.text()?.trim() ?: ""
+                          val tableName = if (prevText.isNotEmpty()) prevText.take(60) else "Таблица #${idx + 1}"
                           parsedTables.add(ParsedTable(tableName, headers, bodyRows))
                       }
                   }
 
                   val matchBlocks = doc.select("[class*=match], [class*=game], [class*=event], a[href*=match], a[href*=game], a[href*=protocol]")
-                  matchBlocks.forEachIndexed { idx, el ->
+                  for (idx in 0 until matchBlocks.size) {
+                      val el = matchBlocks[idx]
                       val text = el.text().trim()
                       if (text.length in 10..180) {
                           val scoreMatch = SCORE_REGEX.find(text)
-                          val teamEls = el.select("[class*=team], [class*=name], [class*=club], span, div")
-                              .map { it.ownText().trim() }
-                              .filter { it.length in 3..35 && !it.all { ch -> ch.isDigit() } }
-                              .distinct()
+                          val subEls = el.select("[class*=team], [class*=name], [class*=club], span, div")
+                          val teamNames = mutableListOf<String>()
+                          for (sEl in subEls) {
+                              val own = sEl.ownText().trim()
+                              if (own.length in 3..35 && !own.all { ch -> ch.isDigit() } && !teamNames.contains(own)) {
+                                  teamNames.add(own)
+                              }
+                          }
 
-                          if (teamEls.size >= 2) {
+                          if (teamNames.size >= 2) {
                               val score = scoreMatch?.value ?: "VS"
-                              val home = teamEls[0]
-                              val away = teamEls[1]
+                              val home = teamNames[0]
+                              val away = teamNames[1]
                               if (extractedMatches.none { it.homeTeam == home && it.awayTeam == away && it.scoreText == score }) {
                                   extractedMatches.add(
                                       HockeyMatch(
@@ -398,44 +423,53 @@ jobs:
                       }
                   }
 
-                  val allClasses = doc.select("*[class]")
-                      .flatMap { it.classNames() }
-                      .groupingBy { it }
-                      .eachCount()
-                      .entries
+                  val classCounts = mutableMapOf<String, Int>()
+                  val classEls = doc.select("[class]")
+                  for (cEl in classEls) {
+                      for (cName in cEl.classNames()) {
+                          classCounts[cName] = (classCounts[cName] ?: 0) + 1
+                      }
+                  }
+                  val topClasses = classCounts.entries
                       .sortedByDescending { it.value }
                       .take(35)
                       .joinToString(", ") { "${it.key}(${it.value})" }
 
-                  val tabLinks = doc.select("a[href*=tournament-tab], [class*=tab]")
-                      .map { "${it.text().trim()} -> ${it.attr("href")}" }
-                      .filter { it.length > 5 }
-                      .distinct()
-                      .take(15)
-                      .joinToString("\n")
+                  val tabEls = doc.select("a[href*=tournament-tab], [class*=tab]")
+                  val tabLines = mutableListOf<String>()
+                  for (tEl in tabEls) {
+                      val line = "${tEl.text().trim()} -> ${tEl.attr("href")}"
+                      if (line.length > 5 && !tabLines.contains(line) && tabLines.size < 15) {
+                          tabLines.add(line)
+                      }
+                  }
 
-                  val sampleTextBlocks = doc.select("table, [class*=table], [class*=match], [class*=stand], main, .content, div")
-                      .filter { it.ownText().isNotBlank() || it.tagName() == "table" }
-                      .map { "${it.tagName()}.${it.className()}: ${it.text().take(140)}" }
-                      .filter { it.length > 20 }
-                      .distinct()
-                      .take(18)
-                      .joinToString("\n---\n")
+                  val blockEls = doc.select("table, [class*=table], [class*=match], [class*=stand], main, .content, div")
+                  val sampleLines = mutableListOf<String>()
+                  for (bEl in blockEls) {
+                      if (bEl.ownText().trim().isNotEmpty() || bEl.tagName() == "table") {
+                          val line = "${bEl.tagName()}.${bEl.className()}: ${bEl.text().take(140)}"
+                          if (line.length > 20 && !sampleLines.contains(line) && sampleLines.size < 18) {
+                              sampleLines.add(line)
+                          }
+                      }
+                  }
 
                   val report = buildString {
-                      appendLine("=== ОТЧЕТ ПАРСЕРА v2.0 (ТУРНИР 54) ===")
+                      appendLine("=== ОТЧЕТ ПАРСЕРА v2.1 (ТУРНИР 54) ===")
                       appendLine("URL: $url")
                       appendLine("Режим: ${if (usedWebView) "WebView (JS выполнен)" else "Прямой Jsoup"}")
-                      appendLine("Title: ${doc.title()}")
+                      appendLine("Title: $docTitle")
                       appendLine("H1/H2: $h1")
                       appendLine("DOM-элементов: ${doc.allElements.size}")
                       appendLine("Таблиц <table>: ${parsedTables.size}")
                       appendLine("Матчей: ${extractedMatches.size}")
                       appendLine("\n--- ВКЛАДКИ ТУРНИРА ---")
-                      appendLine(tabLinks.ifBlank { "Не обнаружены" })
+                      appendLine(if (tabLines.isNotEmpty()) tabLines.joinToString("\n") else "Не обнаружены")
                       appendLine("\n--- ТОП CSS-КЛАССОВ ---")
-                      appendLine(allClasses)
-                      parsedTables.forEachIndexed { i, t ->
+                      appendLine(topClasses)
+                      for (i in 0 until parsedTables.size) {
+                          val t = parsedTables[i]
                           appendLine("\n--- Таблица #${i + 1}: ${t.title} ---")
                           appendLine("Шапка: ${t.headers.joinToString(" | ")}")
                           t.rows.take(4).forEach { r ->
@@ -443,7 +477,7 @@ jobs:
                           }
                       }
                       appendLine("\n--- ТЕКСТОВЫЕ БЛОКИ НА СТРАНИЦЕ ---")
-                      appendLine(sampleTextBlocks)
+                      appendLine(sampleLines.joinToString("\n---\n"))
                   }
 
                   return TournamentPageData(
@@ -493,7 +527,6 @@ jobs:
               var pageData by remember { mutableStateOf<TournamentPageData?>(null) }
               var isLoading by remember { mutableStateOf(true) }
               var selectedMatch by remember { mutableStateOf<HockeyMatch?>(null) }
-              var showIdDialog by remember { mutableStateOf(false) }
 
               fun reload() {
                   scope.launch {
@@ -528,11 +561,10 @@ jobs:
                                       Box(modifier = Modifier.size(9.dp).clip(CircleShape).background(KhlAccentRed))
                                       Spacer(modifier = Modifier.width(8.dp))
                                       Text(
-                                          text = "ФХМ v2.0 • ТУРНИР #$tournamentId",
+                                          text = "ФХМ v2.1 • ТУРНИР #$tournamentId",
                                           color = KhlIceBlue,
                                           fontSize = 12.sp,
-                                          fontWeight = FontWeight.Bold,
-                                          modifier = Modifier.clickable { showIdDialog = true }
+                                          fontWeight = FontWeight.Bold
                                       )
                                   }
                                   Text(
@@ -562,7 +594,9 @@ jobs:
                                   3 to "Вкладка 3 (tab=3)",
                                   4 to "Вкладка 4 (tab=4)"
                               )
-                              siteTabs.forEach { (idx, label) ->
+                              siteTabs.forEach { pair ->
+                                  val idx = pair.first
+                                  val label = pair.second
                                   val active = siteTabIndex == idx
                                   Box(
                                       modifier = Modifier
@@ -578,21 +612,6 @@ jobs:
                                           fontWeight = FontWeight.Bold
                                       )
                                   }
-                              }
-
-                              Box(
-                                  modifier = Modifier
-                                      .clip(RoundedCornerShape(16.dp))
-                                      .background(KhlIceBlue.copy(alpha = 0.2f))
-                                      .clickable { showIdDialog = true }
-                                      .padding(horizontal = 12.dp, vertical = 6.dp)
-                              ) {
-                                  Text(
-                                      text = "ID: $tournamentId",
-                                      color = KhlIceBlue,
-                                      fontSize = 12.sp,
-                                      fontWeight = FontWeight.Bold
-                                  )
                               }
                           }
                       }
@@ -658,31 +677,6 @@ jobs:
                           }
                       }
                   }
-              }
-
-              if (showIdDialog) {
-                  var tempId by remember { mutableStateOf(tournamentId) }
-                  AlertDialog(
-                      onDismissRequest = { showIdDialog = false },
-                      containerColor = KhlCardDark,
-                      title = { Text("ID турнира на fhmoscow.com", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold) },
-                      text = {
-                          OutlinedTextField(
-                              value = tempId,
-                              onValueChange = { tempId = it.filter { ch -> ch.isDigit() } },
-                              label = { Text("Например: 54") },
-                              singleLine = true
-                          )
-                      },
-                      confirmButton = {
-                          TextButton(onClick = {
-                              if (tempId.isNotBlank()) tournamentId = tempId
-                              showIdDialog = false
-                          }) {
-                              Text("Загрузить", color = KhlIceBlue)
-                          }
-                      }
-                  )
               }
 
               selectedMatch?.let { match ->
@@ -794,7 +788,8 @@ jobs:
                                               .background(KhlBgDark, RoundedCornerShape(6.dp))
                                               .padding(vertical = 8.dp, horizontal = 8.dp)
                                       ) {
-                                          table.headers.forEachIndexed { idx, h ->
+                                          for (idx in 0 until table.headers.size) {
+                                              val h = table.headers[idx]
                                               val w = if (idx == 1) 170.dp else 46.dp
                                               Text(
                                                   text = h,
@@ -808,20 +803,22 @@ jobs:
                                       Spacer(modifier = Modifier.height(4.dp))
                                   }
 
-                                  table.rows.forEachIndexed { rIdx, row ->
+                                  for (rIdx in 0 until table.rows.size) {
+                                      val row = table.rows[rIdx]
                                       Row(
                                           modifier = Modifier
                                               .background(if (rIdx % 2 == 0) Color.Transparent else KhlBgDark.copy(alpha = 0.45f))
                                               .padding(vertical = 8.dp, horizontal = 8.dp),
                                           verticalAlignment = Alignment.CenterVertically
                                       ) {
-                                          row.forEachIndexed { cIdx, cell ->
+                                          for (cIdx in 0 until row.size) {
+                                              val cell = row[cIdx]
                                               val w = if (cIdx == 1) 170.dp else 46.dp
-                                              val isHighlight = cIdx == 0 || cIdx == row.lastIndex
+                                              val isHighlight = cIdx == 0 || cIdx == row.size - 1
                                               Text(
                                                   text = cell,
                                                   color = if (isHighlight) KhlIceBlue else Color.White,
-                                                  fontWeight = if (cIdx <= 1 || cIdx == row.lastIndex) FontWeight.Bold else FontWeight.Normal,
+                                                  fontWeight = if (cIdx <= 1 || cIdx == row.size - 1) FontWeight.Bold else FontWeight.Normal,
                                                   fontSize = 12.sp,
                                                   maxLines = 1,
                                                   overflow = TextOverflow.Ellipsis,
@@ -958,9 +955,17 @@ jobs:
           EOF
 
       - name: Build Debug APK
-        run: gradle assembleDebug --no-daemon --stacktrace
+        run: |
+          set -o pipefail
+          gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee build_output.log || {
+            echo "### Ошибка сборки Gradle" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -n 60 build_output.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            exit 1
+          }
 
-      - name: Rename APK to v2
+      - name: Rename APK to v2.1
         run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/fhm-tournament54-v2.apk
 
       - name: Upload APK Artifact
