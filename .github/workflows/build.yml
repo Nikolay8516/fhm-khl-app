@@ -203,7 +203,6 @@ jobs:
           import java.util.Collections
           import kotlin.coroutines.resume
 
-          // --- МОДЕЛИ ДАННЫХ ФХМ (В СТИЛЕ КХЛ) ---
           data class HockeyMatch(
               val id: String,
               val homeTeam: String,
@@ -216,7 +215,6 @@ jobs:
               val tourName: String,
               val statusBadge: String,
               val isFinished: Boolean,
-              val isLive: Boolean,
               val gameUrl: String
           )
 
@@ -235,13 +233,11 @@ jobs:
               val pucksMissed: Int,
               val pucksDiff: Int,
               val points: Int,
-              val tieBreakNote: String,
-              val teamUrl: String
+              val tieBreakNote: String
           )
 
           data class StandingGroup(
               val groupName: String,
-              val groupId: String,
               val rows: List<StandingRow>
           )
 
@@ -249,7 +245,6 @@ jobs:
               val rank: Int,
               val name: String,
               val team: String,
-              val photoUrl: String,
               val statLabel: String,
               val statValue: String
           )
@@ -268,32 +263,21 @@ jobs:
 
           object FhmTournamentParser {
 
-              suspend fun loadTournament(
-                  context: Context,
-                  tournamentId: String,
-                  loadMorePages: Int = 2
-              ): TournamentPageData {
+              suspend fun loadTournament(context: Context, tournamentId: String): TournamentPageData {
                   val targetUrl = "https://fhmoscow.com/tournament/$tournamentId?tournament-tab=2"
-
-                  val webResult = fetchAllDataViaWebView(context, targetUrl, loadMorePages)
+                  val webResult = fetchAllDataViaWebView(context, targetUrl)
                   val renderedHtml = webResult.first
                   val apiPayloads = webResult.second
                   val interceptedUrls = webResult.third
 
-                  val doc = if (renderedHtml.isNotEmpty()) {
-                      Jsoup.parse(renderedHtml, targetUrl)
-                  } else {
-                      Document(targetUrl)
-                  }
-
+                  val doc = if (renderedHtml.isNotEmpty()) Jsoup.parse(renderedHtml, targetUrl) else Document(targetUrl)
                   return buildTournamentData(doc, targetUrl, apiPayloads, interceptedUrls)
               }
 
               @SuppressLint("SetJavaScriptEnabled")
               private suspend fun fetchAllDataViaWebView(
                   context: Context,
-                  url: String,
-                  loadMorePages: Int
+                  url: String
               ): Triple<String, List<Triple<String, String, String>>, List<String>> {
                   return withContext(Dispatchers.Main) {
                       val interceptedUrls = Collections.synchronizedList(mutableListOf<String>())
@@ -311,7 +295,6 @@ jobs:
                                   var finished = false
                                   val mainHandler = Handler(Looper.getMainLooper())
 
-                                  // Перехватываем и URL, и отправляемое тело запроса (reqBody), и JSON-ответ (body)
                                   val hooksJs = "(function() {" +
                                       "window.__fhmPayloads = window.__fhmPayloads || [];" +
                                       "if (!window.__fhmHookedV30) {" +
@@ -343,7 +326,6 @@ jobs:
                                       "}" +
                                       "})();"
 
-                                  // Шаг 1: Раскрываем все 3 группы турнирной таблицы (318, 321, 324)
                                   val openTablesJs = "(function() {" +
                                       "try {" +
                                       "  var summaries = document.querySelectorAll('details.standings-group > summary');" +
@@ -358,7 +340,6 @@ jobs:
                                       "} catch(e) {}" +
                                       "})();"
 
-                                  // Шаг 2: Нажимаем кнопки подгрузки матчей и открываем вкладку лучших игроков (data-tab=4)
                                   val loadMatchesAndPlayersJs = "(function() {" +
                                       "try {" +
                                       "  var blueBtns = document.querySelectorAll('.people-scroll__page button, .button-blue');" +
@@ -407,30 +388,14 @@ jobs:
                                           if (finished) return
                                           webView.evaluateJavascript(hooksJs, null)
 
-                                          // 1.0 сек: раскрываем все группы таблиц
                                           mainHandler.postDelayed({
-                                              if (!finished && cont.isActive) {
-                                                  webView.evaluateJavascript(openTablesJs, null)
-                                              }
+                                              if (!finished && cont.isActive) webView.evaluateJavascript(openTablesJs, null)
                                           }, 1000L)
 
-                                          // 2.5 сек: кликаем по подгрузке матчей и вкладке лучших игроков
                                           mainHandler.postDelayed({
-                                              if (!finished && cont.isActive) {
-                                                  webView.evaluateJavascript(loadMatchesAndPlayersJs, null)
-                                              }
-                                          }, 2500L)
+                                              if (!finished && cont.isActive) webView.evaluateJavascript(loadMatchesAndPlayersJs, null)
+                                          }, 2600L)
 
-                                          // 4.0 сек: если пользователь нажал "Больше матчей", еще раз догружаем страницы
-                                          if (loadMorePages > 1) {
-                                              mainHandler.postDelayed({
-                                                  if (!finished && cont.isActive) {
-                                                      webView.evaluateJavascript(loadMatchesAndPlayersJs, null)
-                                                  }
-                                              }, 4000L)
-                                          }
-
-                                          // 6.2 сек: снимаем все JSON ответы
                                           mainHandler.postDelayed({
                                               if (!finished && cont.isActive) {
                                                   finished = true
@@ -466,7 +431,7 @@ jobs:
                                                       }
                                                   }
                                               }
-                                          }, 6200L)
+                                          }, 6000L)
                                       }
                                   }
 
@@ -496,17 +461,12 @@ jobs:
                   var totalUpcoming = 0
                   var totalPast = 0
 
-                  // Сопоставляем ID групп из HTML: <details class="standings-group" data-standings-group="318"> -> "Группа А"
                   val groupNamesById = mutableMapOf<String, String>()
-                  val orderedGroupTitles = mutableListOf<Pair<String, String>>()
                   val detailsEls = doc.select("details.standings-group")
                   for (dEl in detailsEls) {
                       val gid = dEl.attr("data-standings-group")
                       val gName = dEl.select("summary span").firstOrNull()?.text()?.trim() ?: "Группа"
-                      if (gid.isNotEmpty()) {
-                          groupNamesById[gid] = gName
-                          orderedGroupTitles.add(Pair(gid, gName))
-                      }
+                      if (gid.isNotEmpty()) groupNamesById[gid] = gName
                   }
 
                   val parsedStandingGroups = mutableListOf<StandingGroup>()
@@ -516,11 +476,9 @@ jobs:
                       val apiUrl = payload.first
                       val reqBody = payload.second
                       val body = payload.third.trim()
-
                       if (!body.startsWith("{") && !body.startsWith("[")) continue
 
                       try {
-                          // 1. Разбор матчей (/api/game/list)
                           if (apiUrl.contains("/api/game/list") && body.startsWith("{")) {
                               val json = JSONObject(body)
                               val count = json.optInt("count", 0)
@@ -530,17 +488,16 @@ jobs:
                                       val mObj = items.optJSONObject(i) ?: continue
                                       val match = parseGameJsonItem(mObj, i)
                                       if (match.isFinished) {
-                                          totalPast = maxOf(totalPast, count)
+                                          if (count > totalPast) totalPast = count
                                           if (pastMatches.none { it.id == match.id }) pastMatches.add(match)
                                       } else {
-                                          totalUpcoming = maxOf(totalUpcoming, count)
+                                          if (count > totalUpcoming) totalUpcoming = count
                                           if (upcomingMatches.none { it.id == match.id }) upcomingMatches.add(match)
                                       }
                                   }
                               }
                           }
 
-                          // 2. Разбор турнирных таблиц (/api/tournamentTable/list)
                           if (apiUrl.contains("/api/tournamentTable/list") && body.startsWith("{")) {
                               val json = JSONObject(body)
                               val items = json.optJSONArray("items")
@@ -564,56 +521,23 @@ jobs:
                                               pucksMissed = rObj.optInt("pucksMissed", 0),
                                               pucksDiff = rObj.optInt("pucksDifference", 0),
                                               points = rObj.optInt("score", 0),
-                                              tieBreakNote = rObj.optString("tieBreakRuleLabel", ""),
-                                              teamUrl = rObj.optString("teamUrl", "")
+                                              tieBreakNote = rObj.optString("tieBreakRuleLabel", "")
                                           )
                                       )
                                   }
 
-                                  // Определяем, какая это группа (А, Б или В) по параметру запроса или по числу команд (12=А, 15=Б, 17=В)
                                   val matchedGroupTitle = detectGroupName(reqBody, rows.size, groupNamesById, parsedStandingGroups.size)
                                   val firstTeamId = rows.firstOrNull()?.teamId ?: 0
                                   if (parsedStandingGroups.none { it.rows.firstOrNull()?.teamId == firstTeamId }) {
-                                      parsedStandingGroups.add(
-                                          StandingGroup(
-                                              groupName = matchedGroupTitle,
-                                              groupId = reqBody,
-                                              rows = rows
-                                          )
-                                      )
-                                  }
-                              }
-                          }
-
-                          // 3. Разбор лучших игроков (если пришел JSON со списком игроков)
-                          if (!apiUrl.contains("/api/game/list") && !apiUrl.contains("/api/tournamentTable/list")) {
-                              val json = if (body.startsWith("{")) JSONObject(body) else null
-                              val items = json?.optJSONArray("items") ?: if (body.startsWith("[")) JSONArray(body) else null
-                              if (items != null && items.length() > 0) {
-                                  for (i in 0 until items.length()) {
-                                      val pObj = items.optJSONObject(i) ?: continue
-                                      val pName = pObj.optString("name", pObj.optString("player", pObj.optString("fullName", "")))
-                                      if (pName.isNotEmpty()) {
-                                          bestPlayers.add(
-                                              BestPlayerItem(
-                                                  rank = i + 1,
-                                                  name = pName,
-                                                  team = pObj.optString("team", pObj.optString("club", "")),
-                                                  photoUrl = pObj.optString("photo", pObj.optString("avatar", pObj.optString("logo", ""))),
-                                                  statLabel = pObj.optString("nomination", "Очки"),
-                                                  statValue = pObj.optString("score", pObj.optString("points", pObj.optString("value", "")))
-                                              )
-                                          )
-                                      }
+                                      parsedStandingGroups.add(StandingGroup(groupName = matchedGroupTitle, rows = rows))
                                   }
                               }
                           }
                       } catch (e: Exception) {
-                          // Пропускаем некорректный фрагмент
+                          // ignore
                       }
                   }
 
-                  // Сортируем группы в порядке: Группа А -> Группа Б -> Группа В
                   parsedStandingGroups.sortBy {
                       when {
                           it.groupName.contains("Группа А") -> 1
@@ -623,58 +547,33 @@ jobs:
                       }
                   }
 
-                  // Также проверяем, не отрендерились ли лучшие игроки напрямую в HTML внутри [data-render-module="best-players-block"]
-                  if (bestPlayers.isEmpty()) {
-                      val bestBlock = doc.selectFirst("[data-render-module=best-players-block]")
-                      if (bestBlock != null) {
-                          val cards = bestBlock.select("[class*=player], [class*=card], [class*=item], tr")
-                          for (cEl in cards) {
-                              val texts = cEl.select("span, div, p, strong, a")
-                                  .filter { it.childrenSize() == 0 && it.text().trim().isNotEmpty() }
-                                  .map { it.text().trim() }
-                              if (texts.size >= 3 && !texts.joinToString(" ").contains("Сбросить")) {
-                                  bestPlayers.add(
-                                      BestPlayerItem(
-                                          rank = bestPlayers.size + 1,
-                                          name = texts.getOrNull(0) ?: "",
-                                          team = texts.getOrNull(1) ?: "",
-                                          photoUrl = cEl.selectFirst("img")?.attr("abs:src") ?: "",
-                                          statLabel = texts.getOrNull(2) ?: "",
-                                          statValue = texts.lastOrNull() ?: ""
-                                      )
-                                  )
-                              }
-                          }
-                      }
-                  }
-
                   val payloadSummary = StringBuilder()
                   for (idx in 0 until apiPayloads.size) {
                       val p = apiPayloads[idx]
                       payloadSummary.append("[").append(idx + 1).append("] URL: ").append(p.first)
-                          .append("\nREQ BODY: ").append(p.second)
-                          .append("\nRESP: ").append(p.third.take(600)).append("\n\n")
+                          .append("\nREQ: ").append(p.second)
+                          .append("\nRESP: ").append(p.third.take(500)).append("\n\n")
                   }
 
                   val report = buildString {
                       appendLine("=== ОТЧЕТ ПАРСЕРА v3.0 ===")
                       appendLine("Турнир: $h1")
-                      appendLine("Групп таблиц загружено: ${parsedStandingGroups.size}")
+                      appendLine("Групп таблиц: ${parsedStandingGroups.size}")
                       parsedStandingGroups.forEach { g ->
-                          appendLine(" • ${g.groupName}: ${g.rows.size} команд (Лидер: ${g.rows.firstOrNull()?.teamName})")
+                          appendLine(" • ${g.groupName}: ${g.rows.size} команд (1 место: ${g.rows.firstOrNull()?.teamName})")
                       }
-                      appendLine("Матчей загружено: ${pastMatches.size} из $totalPast (прошедшие), ${upcomingMatches.size} из $totalUpcoming (будущие)")
+                      appendLine("Матчей: ${pastMatches.size} прошедших, ${upcomingMatches.size} будущих")
                       appendLine("\n=== СЕТЕВЫЕ ЗАПРОСЫ ===")
                       appendLine(interceptedUrls.joinToString("\n"))
-                      appendLine("\n=== ДЕТАЛИ API ВЫЗОВОВ (С ПАРАМЕТРАМИ REQ BODY) ===")
+                      appendLine("\n=== API ПАРАМЕТРЫ (REQ / RESP) ===")
                       appendLine(payloadSummary.toString())
                   }
 
                   return TournamentPageData(
                       url = url,
                       tournamentTitle = h1,
-                      totalUpcomingCount = maxOf(totalUpcoming, upcomingMatches.size),
-                      totalPastCount = maxOf(totalPast, pastMatches.size),
+                      totalUpcomingCount = if (totalUpcoming > upcomingMatches.size) totalUpcoming else upcomingMatches.size,
+                      totalPastCount = if (totalPast > pastMatches.size) totalPast else pastMatches.size,
                       upcomingMatches = upcomingMatches,
                       pastMatches = pastMatches,
                       standingGroups = parsedStandingGroups,
@@ -689,19 +588,14 @@ jobs:
                   groupNamesById: Map<String, String>,
                   currentIdx: Int
               ): String {
-                  for ((gid, gname) in groupNamesById) {
-                      if (reqBody.contains(gid)) return gname
+                  for (entry in groupNamesById.entries) {
+                      if (reqBody.contains(entry.key)) return entry.value
                   }
                   return when (teamCount) {
                       12 -> "Группа А"
                       15 -> "Группа Б"
                       17 -> "Группа В"
-                      else -> when (currentIdx) {
-                          0 -> "Группа В"
-                          1 -> "Группа А"
-                          2 -> "Группа Б"
-                          else -> "Группа #${currentIdx + 1}"
-                      }
+                      else -> "Группа #${currentIdx + 1}"
                   }
               }
 
@@ -733,12 +627,7 @@ jobs:
                       else -> ""
                   }
 
-                  val scoreText = if (s1 != null && s2 != null) {
-                      "$s1 : $s2$suffix"
-                  } else {
-                      "VS"
-                  }
-
+                  val scoreText = if (s1 != null && s2 != null) "$s1 : $s2$suffix" else "VS"
                   val statusBadge = when {
                       isLive -> "LIVE"
                       statusInt == 2 -> "ОКОНЧЕН"
@@ -757,7 +646,6 @@ jobs:
                       tourName = tourStr,
                       statusBadge = statusBadge,
                       isFinished = (statusInt == 2),
-                      isLive = isLive,
                       gameUrl = "https://fhmoscow.com$gameUrl"
                   )
               }
@@ -793,8 +681,8 @@ jobs:
               val context = LocalContext.current
               val scope = rememberCoroutineScope()
 
-              var bottomTab by remember { mutableIntStateOf(1) } // Открываем сразу красивую Таблицу КХЛ!
-              var matchFilter by remember { mutableIntStateOf(1) } // 1 = Прошедшие, 0 = Календарь
+              var bottomTab by remember { mutableIntStateOf(1) }
+              var matchFilter by remember { mutableIntStateOf(1) }
               var selectedMatchGroup by remember { mutableStateOf("Все") }
               var selectedTableGroupIdx by remember { mutableIntStateOf(0) }
               var tournamentId by remember { mutableStateOf("54") }
@@ -814,9 +702,7 @@ jobs:
                   }
               }
 
-              LaunchedEffect(tournamentId) {
-                  reload()
-              }
+              LaunchedEffect(tournamentId) { reload() }
 
               val totalLoadedMatches = (pageData?.upcomingMatches?.size ?: 0) + (pageData?.pastMatches?.size ?: 0)
 
@@ -830,22 +716,16 @@ jobs:
                               .padding(top = 10.dp, bottom = 8.dp)
                       ) {
                           Row(
-                              modifier = Modifier
-                                  .fillMaxWidth()
-                                  .padding(horizontal = 14.dp),
+                              modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp),
                               horizontalArrangement = Arrangement.SpaceBetween,
                               verticalAlignment = Alignment.CenterVertically
                           ) {
-                              Column(
-                                  modifier = Modifier
-                                      .weight(1f)
-                                      .clickable { showTournamentPicker = true }
-                              ) {
+                              Column(modifier = Modifier.weight(1f).clickable { showTournamentPicker = true }) {
                                   Row(verticalAlignment = Alignment.CenterVertically) {
                                       Box(modifier = Modifier.size(9.dp).clip(CircleShape).background(KhlAccentRed))
                                       Spacer(modifier = Modifier.width(8.dp))
                                       Text(
-                                          text = "ФХМ • ТУРНИР #$tournamentId (СМЕНИТЬ)",
+                                          text = "ФХМ v3.0 • ТУРНИР #$tournamentId (СМЕНИТЬ)",
                                           color = KhlIceBlue,
                                           fontSize = 11.sp,
                                           fontWeight = FontWeight.Bold
@@ -870,19 +750,14 @@ jobs:
                               }
                           }
 
-                          // Вкладка 0: Фильтры для Матчей
                           if (bottomTab == 0) {
                               Row(
-                                  modifier = Modifier
-                                      .fillMaxWidth()
-                                      .padding(horizontal = 12.dp, vertical = 4.dp),
+                                  modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
                                   horizontalArrangement = Arrangement.spacedBy(8.dp)
                               ) {
-                                  val pastTotal = pageData?.totalPastCount ?: 0
-                                  val upTotal = pageData?.totalUpcomingCount ?: 0
                                   val filters = listOf(
-                                      1 to "Прошедшие (${pageData?.pastMatches?.size ?: 0} из $pastTotal)",
-                                      0 to "Ближайшие (${pageData?.upcomingMatches?.size ?: 0} из $upTotal)"
+                                      1 to "Прошедшие (${pageData?.pastMatches?.size ?: 0})",
+                                      0 to "Ближайшие (${pageData?.upcomingMatches?.size ?: 0})"
                                   )
                                   filters.forEach { pair ->
                                       val idx = pair.first
@@ -895,22 +770,14 @@ jobs:
                                               .clickable { matchFilter = idx }
                                               .padding(horizontal = 12.dp, vertical = 6.dp)
                                       ) {
-                                          Text(
-                                              text = label,
-                                              color = if (active) Color.White else KhlTextGray,
-                                              fontSize = 12.sp,
-                                              fontWeight = FontWeight.Bold
-                                          )
+                                          Text(label, color = if (active) Color.White else KhlTextGray, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                                       }
                                   }
                               }
 
                               val groupOptions = listOf("Все", "Группа А", "Группа Б", "Группа В")
                               Row(
-                                  modifier = Modifier
-                                      .fillMaxWidth()
-                                      .horizontalScroll(rememberScrollState())
-                                      .padding(horizontal = 12.dp, vertical = 2.dp),
+                                  modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 2.dp),
                                   horizontalArrangement = Arrangement.spacedBy(6.dp)
                               ) {
                                   groupOptions.forEach { grp ->
@@ -922,26 +789,17 @@ jobs:
                                               .clickable { selectedMatchGroup = grp }
                                               .padding(horizontal = 10.dp, vertical = 4.dp)
                                       ) {
-                                          Text(
-                                              text = grp,
-                                              color = if (isSel) KhlIceBlue else KhlTextGray,
-                                              fontSize = 12.sp,
-                                              fontWeight = FontWeight.SemiBold
-                                          )
+                                          Text(grp, color = if (isSel) KhlIceBlue else KhlTextGray, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                                       }
                                   }
                               }
                           }
 
-                          // Вкладка 1: Переключатель Групп Турнирной Таблицы (Группа А, Группа Б, Группа В)
                           if (bottomTab == 1) {
                               val groups = pageData?.standingGroups ?: emptyList()
                               if (groups.isNotEmpty()) {
                                   Row(
-                                      modifier = Modifier
-                                          .fillMaxWidth()
-                                          .horizontalScroll(rememberScrollState())
-                                          .padding(horizontal = 12.dp, vertical = 6.dp),
+                                      modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 6.dp),
                                       horizontalArrangement = Arrangement.spacedBy(8.dp)
                                   ) {
                                       for (idx in 0 until groups.size) {
@@ -954,12 +812,7 @@ jobs:
                                                   .clickable { selectedTableGroupIdx = idx }
                                                   .padding(horizontal = 14.dp, vertical = 6.dp)
                                           ) {
-                                              Text(
-                                                  text = "${g.groupName} (${g.rows.size})",
-                                                  color = if (active) Color.White else KhlTextGray,
-                                                  fontSize = 12.sp,
-                                                  fontWeight = FontWeight.Bold
-                                              )
+                                              Text("${g.groupName} (${g.rows.size})", color = if (active) Color.White else KhlTextGray, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                                           }
                                       }
                                   }
@@ -996,16 +849,9 @@ jobs:
                       }
                   }
               ) { innerPadding ->
-                  Box(
-                      modifier = Modifier
-                          .fillMaxSize()
-                          .padding(innerPadding)
-                  ) {
+                  Box(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
                       if (isLoading) {
-                          Column(
-                              modifier = Modifier.align(Alignment.Center),
-                              horizontalAlignment = Alignment.CenterHorizontally
-                          ) {
+                          Column(modifier = Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
                               CircularProgressIndicator(color = KhlAccentRed)
                               Spacer(modifier = Modifier.height(12.dp))
                               Text(
@@ -1022,19 +868,12 @@ jobs:
                               when (bottomTab) {
                                   0 -> {
                                       val baseList = if (matchFilter == 1) data.pastMatches else data.upcomingMatches
-                                      val filtered = if (selectedMatchGroup == "Все") {
-                                          baseList
-                                      } else {
-                                          baseList.filter { it.groupName.equals(selectedMatchGroup, ignoreCase = true) }
-                                      }
+                                      val filtered = if (selectedMatchGroup == "Все") baseList else baseList.filter { it.groupName.equals(selectedMatchGroup, ignoreCase = true) }
                                       LiveMatchesScreen(filtered, onMatchClick = { selectedMatch = it })
                                   }
                                   1 -> {
                                       val group = data.standingGroups.getOrNull(selectedTableGroupIdx)
-                                      KhlStandingsScreen(
-                                          group = group,
-                                          onTeamClick = { selectedTeamRow = it }
-                                      )
+                                      KhlStandingsScreen(group = group, onTeamClick = { selectedTeamRow = it })
                                   }
                                   2 -> LivePlayersScreen(data)
                                   3 -> WebAndDomScreen(data)
@@ -1044,17 +883,9 @@ jobs:
                   }
               }
 
-              // Модальное окно выбора турнира ФХМ
               if (showTournamentPicker) {
                   var customId by remember { mutableStateOf(tournamentId) }
-                  val quickTournaments = listOf(
-                      "54" to "Кубок Москвы 2017 г.р. (4x4)",
-                      "53" to "Турнир ФХМ #53",
-                      "52" to "Турнир ФХМ #52",
-                      "51" to "Турнир ФХМ #51",
-                      "50" to "Турнир ФХМ #50",
-                      "49" to "Турнир ФХМ #49"
-                  )
+                  val quickList = listOf("54", "53", "52", "51", "50")
                   AlertDialog(
                       onDismissRequest = { showTournamentPicker = false },
                       containerColor = KhlCardDark,
@@ -1064,23 +895,23 @@ jobs:
                               OutlinedTextField(
                                   value = customId,
                                   onValueChange = { customId = it.filter { c -> c.isDigit() } },
-                                  label = { Text("ID турнира (из ссылки fhmoscow.com/tournament/ID)") },
+                                  label = { Text("ID турнира (например, 54)") },
                                   singleLine = true
                               )
-                              Text("Быстрый переход:", color = KhlTextGray, fontSize = 12.sp)
-                              quickTournaments.forEach { (id, name) ->
-                                  Box(
-                                      modifier = Modifier
-                                          .fillMaxWidth()
-                                          .clip(RoundedCornerShape(8.dp))
-                                          .background(KhlBgDark)
-                                          .clickable {
-                                              tournamentId = id
-                                              showTournamentPicker = false
-                                          }
-                                          .padding(10.dp)
-                                  ) {
-                                      Text("#$id — $name", color = Color.White, fontSize = 13.sp)
+                              Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                  quickList.forEach { qId ->
+                                      Box(
+                                          modifier = Modifier
+                                              .clip(RoundedCornerShape(8.dp))
+                                              .background(KhlBgDark)
+                                              .clickable {
+                                                  tournamentId = qId
+                                                  showTournamentPicker = false
+                                              }
+                                              .padding(horizontal = 10.dp, vertical = 6.dp)
+                                      ) {
+                                          Text("#$qId", color = KhlIceBlue, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                      }
                                   }
                               }
                           }
@@ -1096,7 +927,6 @@ jobs:
                   )
               }
 
-              // Карточка команды из турнирной таблицы
               selectedTeamRow?.let { row ->
                   AlertDialog(
                       onDismissRequest = { selectedTeamRow = null },
@@ -1116,11 +946,9 @@ jobs:
                       text = {
                           Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                               Text("Очки: ${row.points}  |  Игры: ${row.games}", color = KhlIceBlue, fontSize = 15.sp, fontWeight = FontWeight.Black)
-                              Text("Победы: ${row.wins} (ОТ/Б: ${row.otWins}) • Ничьи: ${row.ties} • Поражения: ${row.losses} (ОТ/Б: ${row.otLosses})", color = Color.White, fontSize = 13.sp)
-                              Text("Шайбы: ${row.pucksScored} заброшено / ${row.pucksMissed} пропущено (Разница: ${if (row.pucksDiff > 0) "+${row.pucksDiff}" else row.pucksDiff})", color = Color.White, fontSize = 13.sp)
+                              Text("Победы: ${row.wins} (ОТ: ${row.otWins}) • Ничьи: ${row.ties} • Поражения: ${row.losses}", color = Color.White, fontSize = 13.sp)
+                              Text("Шайбы: ${row.pucksScored} - ${row.pucksMissed} (${if (row.pucksDiff > 0) "+${row.pucksDiff}" else row.pucksDiff})", color = Color.White, fontSize = 13.sp)
                               if (row.tieBreakNote.isNotEmpty()) {
-                                  Spacer(modifier = Modifier.height(4.dp))
-                                  Text("Критерий позиции ФХМ:", color = KhlTextGray, fontSize = 11.sp)
                                   Text(row.tieBreakNote, color = KhlTextGray, fontSize = 12.sp)
                               }
                           }
@@ -1133,20 +961,17 @@ jobs:
                   )
               }
 
-              // Детали матча
               selectedMatch?.let { match ->
                   AlertDialog(
                       onDismissRequest = { selectedMatch = null },
                       containerColor = KhlCardDark,
-                      title = {
-                          Text("${match.homeTeam} — ${match.awayTeam}", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                      },
+                      title = { Text("${match.homeTeam} — ${match.awayTeam}", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold) },
                       text = {
                           Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                               Text("Счет: ${match.scoreText}", color = KhlIceBlue, fontSize = 16.sp, fontWeight = FontWeight.Black)
                               Text("${match.groupName} • ${match.tourName}", color = KhlAccentRed, fontSize = 13.sp, fontWeight = FontWeight.Bold)
                               Text("Дата: ${match.dateText}", color = Color.White, fontSize = 13.sp)
-                              Text("Протокол матча: ${match.gameUrl}", color = KhlTextGray, fontSize = 11.sp)
+                              Text("Протокол: ${match.gameUrl}", color = KhlTextGray, fontSize = 11.sp)
                           }
                       },
                       confirmButton = {
@@ -1159,37 +984,22 @@ jobs:
           }
 
           @Composable
-          fun KhlStandingsScreen(
-              group: StandingGroup?,
-              onTeamClick: (StandingRow) -> Unit
-          ) {
+          fun KhlStandingsScreen(group: StandingGroup?, onTeamClick: (StandingRow) -> Unit) {
               if (group == null || group.rows.isEmpty()) {
                   Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-                      Text(
-                          text = "Таблица группы загружается или пуста.",
-                          color = KhlTextGray,
-                          fontSize = 14.sp,
-                          textAlign = TextAlign.Center
-                      )
+                      Text("Таблица загружается...", color = KhlTextGray, fontSize = 14.sp)
                   }
                   return
               }
 
-              LazyColumn(
-                  contentPadding = PaddingValues(12.dp),
-                  verticalArrangement = Arrangement.spacedBy(6.dp)
-              ) {
-                  // Шапка таблицы в стиле КХЛ
+              LazyColumn(contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                   item {
                       Row(
-                          modifier = Modifier
-                              .fillMaxWidth()
-                              .background(KhlCardDark.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
-                              .padding(horizontal = 10.dp, vertical = 8.dp),
+                          modifier = Modifier.fillMaxWidth().background(KhlCardDark.copy(alpha = 0.6f), RoundedCornerShape(8.dp)).padding(horizontal = 10.dp, vertical = 8.dp),
                           verticalAlignment = Alignment.CenterVertically
                       ) {
                           Text("#", color = KhlTextGray, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.width(24.dp))
-                          Text("КЛУБ (${group.groupName.uppercase()})", color = KhlTextGray, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                          Text("КЛУБ (${group.groupName})", color = KhlTextGray, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
                           Text("И", color = KhlTextGray, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.width(24.dp), textAlign = TextAlign.Center)
                           Text("В", color = KhlTextGray, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.width(24.dp), textAlign = TextAlign.Center)
                           Text("Н", color = KhlTextGray, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.width(22.dp), textAlign = TextAlign.Center)
@@ -1200,48 +1010,28 @@ jobs:
                   }
 
                   items(group.rows) { row ->
-                      val isTop3 = row.position <= 3
                       Card(
                           colors = CardDefaults.cardColors(containerColor = KhlCardDark),
                           shape = RoundedCornerShape(10.dp),
-                          modifier = Modifier
-                              .fillMaxWidth()
-                              .clickable { onTeamClick(row) }
+                          modifier = Modifier.fillMaxWidth().clickable { onTeamClick(row) }
                       ) {
                           Row(
-                              modifier = Modifier
-                                  .fillMaxWidth()
-                                  .padding(horizontal = 10.dp, vertical = 10.dp),
+                              modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 10.dp),
                               verticalAlignment = Alignment.CenterVertically
                           ) {
-                              // Позиция
-                              Box(
-                                  modifier = Modifier
-                                      .width(24.dp),
-                                  contentAlignment = Alignment.CenterStart
-                              ) {
-                                  Text(
-                                      text = row.position.toString(),
-                                      color = if (isTop3) KhlAccentRed else KhlTextGray,
-                                      fontWeight = FontWeight.Black,
-                                      fontSize = 13.sp
-                                  )
-                              }
-
-                              // Логотип + Название команды
-                              Row(
-                                  modifier = Modifier.weight(1f),
-                                  verticalAlignment = Alignment.CenterVertically
-                              ) {
+                              Text(
+                                  text = row.position.toString(),
+                                  color = if (row.position <= 3) KhlAccentRed else KhlTextGray,
+                                  fontWeight = FontWeight.Black,
+                                  fontSize = 13.sp,
+                                  modifier = Modifier.width(24.dp)
+                              )
+                              Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
                                   AsyncImage(
                                       model = row.logoUrl,
                                       contentDescription = row.teamName,
                                       contentScale = ContentScale.Fit,
-                                      modifier = Modifier
-                                          .size(28.dp)
-                                          .clip(CircleShape)
-                                          .background(Color.White.copy(alpha = 0.08f))
-                                          .padding(2.dp)
+                                      modifier = Modifier.size(28.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.08f)).padding(2.dp)
                                   )
                                   Spacer(modifier = Modifier.width(8.dp))
                                   Text(
@@ -1253,27 +1043,12 @@ jobs:
                                       overflow = TextOverflow.Ellipsis
                                   )
                               }
-
-                              // И, В, Н, П, Шайбы, Очки
                               Text(row.games.toString(), color = KhlTextGray, fontSize = 12.sp, modifier = Modifier.width(24.dp), textAlign = TextAlign.Center)
                               Text(row.wins.toString(), color = KhlWinGreen, fontWeight = FontWeight.Bold, fontSize = 12.sp, modifier = Modifier.width(24.dp), textAlign = TextAlign.Center)
                               Text(row.ties.toString(), color = KhlTextGray, fontSize = 12.sp, modifier = Modifier.width(22.dp), textAlign = TextAlign.Center)
                               Text(row.losses.toString(), color = KhlTextGray, fontSize = 12.sp, modifier = Modifier.width(24.dp), textAlign = TextAlign.Center)
-                              Text(
-                                  text = "${row.pucksScored}-${row.pucksMissed}",
-                                  color = Color.White,
-                                  fontSize = 11.sp,
-                                  modifier = Modifier.width(56.dp),
-                                  textAlign = TextAlign.Center
-                              )
-                              Text(
-                                  text = row.points.toString(),
-                                  color = KhlIceBlue,
-                                  fontWeight = FontWeight.Black,
-                                  fontSize = 14.sp,
-                                  modifier = Modifier.width(28.dp),
-                                  textAlign = TextAlign.End
-                              )
+                              Text("${row.pucksScored}-${row.pucksMissed}", color = Color.White, fontSize = 11.sp, modifier = Modifier.width(56.dp), textAlign = TextAlign.Center)
+                              Text(row.points.toString(), color = KhlIceBlue, fontWeight = FontWeight.Black, fontSize = 14.sp, modifier = Modifier.width(28.dp), textAlign = TextAlign.End)
                           }
                       }
                   }
@@ -1284,12 +1059,7 @@ jobs:
           fun LiveMatchesScreen(matches: List<HockeyMatch>, onMatchClick: (HockeyMatch) -> Unit) {
               if (matches.isEmpty()) {
                   Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-                      Text(
-                          text = "Для выбранной группы матчей не найдено.",
-                          color = KhlTextGray,
-                          fontSize = 14.sp,
-                          textAlign = TextAlign.Center
-                      )
+                      Text("Матчей для выбранного фильтра нет.", color = KhlTextGray, fontSize = 14.sp)
                   }
                   return
               }
@@ -1302,108 +1072,38 @@ jobs:
                           modifier = Modifier.fillMaxWidth().clickable { onMatchClick(match) }
                       ) {
                           Column(modifier = Modifier.padding(14.dp)) {
-                              Row(
-                                  modifier = Modifier.fillMaxWidth(),
-                                  horizontalArrangement = Arrangement.SpaceBetween,
-                                  verticalAlignment = Alignment.CenterVertically
-                              ) {
-                                  Text(
-                                      text = "${match.groupName} • ${match.tourName}",
-                                      color = KhlIceBlue,
-                                      fontSize = 11.sp,
-                                      fontWeight = FontWeight.Bold
-                                  )
-                                  Text(
-                                      text = match.statusBadge,
-                                      color = if (match.isFinished) KhlTextGray else KhlAccentRed,
-                                      fontSize = 11.sp,
-                                      fontWeight = FontWeight.Bold
-                                  )
+                              Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                  Text("${match.groupName} • ${match.tourName}", color = KhlIceBlue, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                  Text(match.statusBadge, color = if (match.isFinished) KhlTextGray else KhlAccentRed, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                               }
-
                               Spacer(modifier = Modifier.height(12.dp))
-
-                              Row(
-                                  modifier = Modifier.fillMaxWidth(),
-                                  verticalAlignment = Alignment.CenterVertically,
-                                  horizontalArrangement = Arrangement.SpaceBetween
-                              ) {
-                                  Row(
-                                      modifier = Modifier.weight(1f),
-                                      verticalAlignment = Alignment.CenterVertically
-                                  ) {
+                              Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                                  Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
                                       AsyncImage(
                                           model = match.homeLogo,
                                           contentDescription = match.homeTeam,
                                           contentScale = ContentScale.Fit,
-                                          modifier = Modifier
-                                              .size(36.dp)
-                                              .clip(CircleShape)
-                                              .background(Color.White.copy(alpha = 0.08f))
-                                              .padding(4.dp)
+                                          modifier = Modifier.size(36.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.08f)).padding(4.dp)
                                       )
                                       Spacer(modifier = Modifier.width(8.dp))
-                                      Text(
-                                          text = match.homeTeam,
-                                          color = Color.White,
-                                          fontSize = 13.sp,
-                                          fontWeight = FontWeight.Bold,
-                                          maxLines = 2,
-                                          overflow = TextOverflow.Ellipsis
-                                      )
+                                      Text(match.homeTeam, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
                                   }
-
-                                  Box(
-                                      modifier = Modifier
-                                          .padding(horizontal = 8.dp)
-                                          .clip(RoundedCornerShape(8.dp))
-                                          .background(KhlBgDark)
-                                          .padding(horizontal = 12.dp, vertical = 6.dp)
-                                  ) {
-                                      Text(
-                                          text = match.scoreText,
-                                          color = Color.White,
-                                          fontSize = 18.sp,
-                                          fontWeight = FontWeight.Black
-                                      )
+                                  Box(modifier = Modifier.padding(horizontal = 8.dp).clip(RoundedCornerShape(8.dp)).background(KhlBgDark).padding(horizontal = 12.dp, vertical = 6.dp)) {
+                                      Text(match.scoreText, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Black)
                                   }
-
-                                  Row(
-                                      modifier = Modifier.weight(1f),
-                                      verticalAlignment = Alignment.CenterVertically,
-                                      horizontalArrangement = Arrangement.End
-                                  ) {
-                                      Text(
-                                          text = match.awayTeam,
-                                          color = Color.White,
-                                          fontSize = 13.sp,
-                                          fontWeight = FontWeight.Bold,
-                                          textAlign = TextAlign.End,
-                                          maxLines = 2,
-                                          overflow = TextOverflow.Ellipsis,
-                                          modifier = Modifier.weight(1f)
-                                      )
+                                  Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.End) {
+                                      Text(match.awayTeam, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.End, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
                                       Spacer(modifier = Modifier.width(8.dp))
                                       AsyncImage(
                                           model = match.awayLogo,
                                           contentDescription = match.awayTeam,
                                           contentScale = ContentScale.Fit,
-                                          modifier = Modifier
-                                              .size(36.dp)
-                                              .clip(CircleShape)
-                                              .background(Color.White.copy(alpha = 0.08f))
-                                              .padding(4.dp)
+                                          modifier = Modifier.size(36.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.08f)).padding(4.dp)
                                       )
                                   }
                               }
-
                               Spacer(modifier = Modifier.height(10.dp))
-
-                              Text(
-                                  text = match.dateText,
-                                  color = KhlTextGray,
-                                  fontSize = 11.sp
-                              )
+                              Text(match.dateText, color = KhlTextGray, fontSize = 11.sp)
                           }
                       }
                   }
@@ -1412,38 +1112,13 @@ jobs:
 
           @Composable
           fun LivePlayersScreen(data: TournamentPageData) {
-              if (data.bestPlayers.isEmpty()) {
-                  Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-                      Text(
-                          text = "Для турнира 2017 г.р. (формат 4x4) индивидуальная статистика бомбардиров на сайте ФХМ не ведется (или еще не опубликована).\n\nПопробуй нажать сверху «Сменить турнир» и выбрать старший возраст (например, 50, 51, 52, 53)!",
-                          color = KhlTextGray,
-                          fontSize = 14.sp,
-                          textAlign = TextAlign.Center
-                      )
-                  }
-                  return
-              }
-
-              LazyColumn(contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                  items(data.bestPlayers) { p ->
-                      Card(
-                          colors = CardDefaults.cardColors(containerColor = KhlCardDark),
-                          shape = RoundedCornerShape(12.dp),
-                          modifier = Modifier.fillMaxWidth()
-                      ) {
-                          Row(
-                              modifier = Modifier.fillMaxWidth().padding(12.dp),
-                              verticalAlignment = Alignment.CenterVertically,
-                              horizontalArrangement = Arrangement.SpaceBetween
-                          ) {
-                              Column(modifier = Modifier.weight(1f)) {
-                                  Text("${p.rank}. ${p.name}", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                                  Text(p.team, color = KhlIceBlue, fontSize = 12.sp)
-                              }
-                              Text("${p.statLabel}: ${p.statValue}", color = KhlAccentRed, fontWeight = FontWeight.Black, fontSize = 14.sp)
-                          }
-                      }
-                  }
+              Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+                  Text(
+                      text = "Нажми сверху на название турнира, чтобы переключиться на старшие возраста (например, #50, #51, #52, #53), или открой вкладку «Веб / API».",
+                      color = KhlTextGray,
+                      fontSize = 14.sp,
+                      textAlign = TextAlign.Center
+                  )
               }
           }
 
@@ -1454,17 +1129,12 @@ jobs:
               var showLiveWeb by remember { mutableStateOf(false) }
 
               Column(modifier = Modifier.fillMaxSize()) {
-                  Row(
-                      modifier = Modifier
-                          .fillMaxWidth()
-                          .padding(horizontal = 12.dp, vertical = 8.dp),
-                      horizontalArrangement = Arrangement.spacedBy(8.dp)
-                  ) {
+                  Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                       Button(
                           onClick = {
                               val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                               clipboard.setPrimaryClip(ClipData.newPlainText("FHM_V30", data.diagnosticReport))
-                              Toast.makeText(context, "Отчет скопирован!", Toast.LENGTH_LONG).show()
+                              Toast.makeText(context, "Скопировано!", Toast.LENGTH_LONG).show()
                           },
                           colors = ButtonDefaults.buttonColors(containerColor = KhlAccentRed),
                           modifier = Modifier.weight(1f)
@@ -1473,7 +1143,6 @@ jobs:
                           Spacer(modifier = Modifier.width(6.dp))
                           Text("Скопировать API", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                       }
-
                       Button(
                           onClick = { showLiveWeb = !showLiveWeb },
                           colors = ButtonDefaults.buttonColors(containerColor = KhlCardDark),
@@ -1481,12 +1150,7 @@ jobs:
                       ) {
                           Icon(Icons.Default.Public, contentDescription = null, modifier = Modifier.size(16.dp), tint = KhlIceBlue)
                           Spacer(modifier = Modifier.width(6.dp))
-                          Text(
-                              text = if (showLiveWeb) "Показать отчет" else "Открыть веб-вид",
-                              color = KhlIceBlue,
-                              fontSize = 12.sp,
-                              fontWeight = FontWeight.Bold
-                          )
+                          Text(if (showLiveWeb) "Показать отчет" else "Открыть веб-вид", color = KhlIceBlue, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                       }
                   }
 
@@ -1500,31 +1164,13 @@ jobs:
                                   webViewClient = WebViewClient()
                                   loadUrl(data.url)
                               }
-                          },
-                          update = { webView ->
-                              if (webView.url != data.url) {
-                                  webView.loadUrl(data.url)
-                              }
                           }
                       )
                   } else {
-                      LazyColumn(
-                          contentPadding = PaddingValues(12.dp),
-                          modifier = Modifier.fillMaxSize()
-                      ) {
+                      LazyColumn(contentPadding = PaddingValues(12.dp), modifier = Modifier.fillMaxSize()) {
                           item {
-                              Card(
-                                  colors = CardDefaults.cardColors(containerColor = KhlCardDark),
-                                  shape = RoundedCornerShape(12.dp),
-                                  modifier = Modifier.fillMaxWidth()
-                              ) {
-                                  Text(
-                                      text = data.diagnosticReport,
-                                      color = Color.White,
-                                      fontSize = 11.sp,
-                                      fontFamily = FontFamily.Monospace,
-                                      modifier = Modifier.padding(12.dp)
-                                  )
+                              Card(colors = CardDefaults.cardColors(containerColor = KhlCardDark), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                                  Text(data.diagnosticReport, color = Color.White, fontSize = 11.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.padding(12.dp))
                               }
                           }
                       }
