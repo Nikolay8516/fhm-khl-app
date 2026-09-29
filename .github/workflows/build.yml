@@ -1,4 +1,4 @@
-name: Build FHM v3.0 APK
+name: Build FHM v3.1 APK
 
 on:
   push:
@@ -25,7 +25,7 @@ jobs:
           unzip -q gradle-8.7-bin.zip -d /tmp
           echo "/tmp/gradle-8.7/bin" >> $GITHUB_PATH
 
-      - name: Generate v3.0 project
+      - name: Generate v3.1 project
         run: |
           rm -rf app settings.gradle.kts build.gradle.kts gradle.properties
           mkdir -p app/src/main/java/com/fhm/khlstyle
@@ -45,7 +45,7 @@ jobs:
                   mavenCentral()
               }
           }
-          rootProject.name = "FHM_KHL_V30"
+          rootProject.name = "FHM_KHL_V31"
           include(":app")
           EOF
 
@@ -77,8 +77,8 @@ jobs:
                   applicationId = "com.fhm.khlstyle"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 30
-                  versionName = "3.0"
+                  versionCode = 31
+                  versionName = "3.1"
               }
 
               buildTypes {
@@ -149,8 +149,6 @@ jobs:
           import android.os.Bundle
           import android.os.Handler
           import android.os.Looper
-          import android.webkit.WebResourceRequest
-          import android.webkit.WebResourceResponse
           import android.webkit.WebView
           import android.webkit.WebViewClient
           import android.widget.Toast
@@ -200,7 +198,6 @@ jobs:
           import org.json.JSONTokener
           import org.jsoup.Jsoup
           import org.jsoup.nodes.Document
-          import java.util.Collections
           import kotlin.coroutines.resume
 
           data class HockeyMatch(
@@ -242,11 +239,21 @@ jobs:
           )
 
           data class BestPlayerItem(
+              val id: String,
               val rank: Int,
-              val name: String,
-              val team: String,
-              val statLabel: String,
-              val statValue: String
+              val fullName: String,
+              val shortName: String,
+              val number: String,
+              val roleName: String,
+              val birthDate: String,
+              val clubName: String,
+              val clubLogo: String,
+              val photoUrl: String,
+              val categoryKey: String,
+              val categoryTitle: String,
+              val statSummary: String,
+              val mainValue: String,
+              val rawStatJson: String
           )
 
           data class TournamentPageData(
@@ -257,7 +264,7 @@ jobs:
               val upcomingMatches: List<HockeyMatch>,
               val pastMatches: List<HockeyMatch>,
               val standingGroups: List<StandingGroup>,
-              val bestPlayers: List<BestPlayerItem>,
+              val playersByCategory: Map<String, List<BestPlayerItem>>,
               val diagnosticReport: String
           )
 
@@ -265,26 +272,24 @@ jobs:
 
               suspend fun loadTournament(context: Context, tournamentId: String): TournamentPageData {
                   val targetUrl = "https://fhmoscow.com/tournament/$tournamentId?tournament-tab=2"
-                  val webResult = fetchAllDataViaWebView(context, targetUrl)
+                  val webResult = fetchDirectApiBatchViaWebView(context, targetUrl, tournamentId)
                   val renderedHtml = webResult.first
                   val apiPayloads = webResult.second
-                  val interceptedUrls = webResult.third
 
                   val doc = if (renderedHtml.isNotEmpty()) Jsoup.parse(renderedHtml, targetUrl) else Document(targetUrl)
-                  return buildTournamentData(doc, targetUrl, apiPayloads, interceptedUrls)
+                  return buildTournamentData(doc, targetUrl, apiPayloads)
               }
 
               @SuppressLint("SetJavaScriptEnabled")
-              private suspend fun fetchAllDataViaWebView(
+              private suspend fun fetchDirectApiBatchViaWebView(
                   context: Context,
-                  url: String
-              ): Triple<String, List<Triple<String, String, String>>, List<String>> {
+                  url: String,
+                  tournamentId: String
+              ): Pair<String, List<Triple<String, String, String>>> {
                   return withContext(Dispatchers.Main) {
-                      val interceptedUrls = Collections.synchronizedList(mutableListOf<String>())
-
-                      val result: Triple<String, List<Triple<String, String, String>>, List<String>>? =
-                          withTimeoutOrNull<Triple<String, List<Triple<String, String, String>>, List<String>>>(28000L) {
-                              suspendCancellableCoroutine<Triple<String, List<Triple<String, String, String>>, List<String>>> { cont ->
+                      val result: Pair<String, List<Triple<String, String, String>>>? =
+                          withTimeoutOrNull<Pair<String, List<Triple<String, String, String>>> >(25000L) {
+                              suspendCancellableCoroutine<Pair<String, List<Triple<String, String, String>>>> { cont ->
                                   val webView = WebView(context)
                                   webView.layout(0, 0, 1080, 2400)
                                   webView.settings.javaScriptEnabled = true
@@ -297,8 +302,8 @@ jobs:
 
                                   val hooksJs = "(function() {" +
                                       "window.__fhmPayloads = window.__fhmPayloads || [];" +
-                                      "if (!window.__fhmHookedV30) {" +
-                                      "  window.__fhmHookedV30 = true;" +
+                                      "if (!window.__fhmHookedV31) {" +
+                                      "  window.__fhmHookedV31 = true;" +
                                       "  var origFetch = window.fetch;" +
                                       "  if (origFetch) {" +
                                       "    window.fetch = function() {" +
@@ -307,7 +312,7 @@ jobs:
                                       "      var reqB = (opts && opts.body) ? String(opts.body) : '';" +
                                       "      var uStr = (typeof u === 'string') ? u : (u && u.url ? u.url : 'fetch');" +
                                       "      return origFetch.apply(this, arguments).then(function(resp) {" +
-                                      "        try { resp.clone().text().then(function(txt) { window.__fhmPayloads.push({ url: uStr, req: reqB, body: txt.substring(0, 45000) }); }); } catch(e) {}" +
+                                      "        try { resp.clone().text().then(function(txt) { window.__fhmPayloads.push({ url: uStr, req: reqB, body: txt.substring(0, 95000) }); }); } catch(e) {}" +
                                       "        return resp;" +
                                       "      });" +
                                       "    };" +
@@ -319,39 +324,43 @@ jobs:
                                       "    var self = this;" +
                                       "    var reqB = data ? String(data) : '';" +
                                       "    this.addEventListener('load', function() {" +
-                                      "      try { window.__fhmPayloads.push({ url: (self._url || 'xhr'), req: reqB, body: (self.responseText || '').substring(0, 45000) }); } catch(e) {}" +
+                                      "      try { window.__fhmPayloads.push({ url: (self._url || 'xhr'), req: reqB, body: (self.responseText || '').substring(0, 95000) }); } catch(e) {}" +
                                       "    });" +
                                       "    return origSend.apply(this, arguments);" +
                                       "  };" +
                                       "}" +
                                       "})();"
 
-                                  val openTablesJs = "(function() {" +
+                                  // Выполняем прямые POST-запросы к открытому нами API fhmoscow.com прямо из контекста страницы:
+                                  // 1) Все прошедшие матчи (limit: 100, period: "-")
+                                  // 2) Все будущие матчи (limit: 100, period: "+")
+                                  // 3) Все группы таблиц (из атрибутов data-standings-group)
+                                  // 4) Все номинации лучших игроков (/api/playerStatistic/list с limit: 15)
+                                  val directApiBatchJs = "(function() {" +
                                       "try {" +
-                                      "  var summaries = document.querySelectorAll('details.standings-group > summary');" +
-                                      "  for (var i = 0; i < summaries.length; i++) {" +
-                                      "    var det = summaries[i].parentElement;" +
-                                      "    if (det && !det.hasAttribute('open')) {" +
-                                      "      summaries[i].click();" +
-                                      "      det.open = true;" +
-                                      "      det.dispatchEvent(new Event('toggle'));" +
-                                      "    }" +
+                                      "  var tid = parseInt('$tournamentId', 10) || 54;" +
+                                      "  var postJson = function(endpoint, payloadObj) {" +
+                                      "    var bodyStr = JSON.stringify(payloadObj);" +
+                                      "    fetch(endpoint, {" +
+                                      "      method: 'POST'," +
+                                      "      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' }," +
+                                      "      body: bodyStr" +
+                                      "    });" +
+                                      "  };" +
+                                      "  postJson('/api/game/list', { dateFrom: null, dateTo: null, limit: 100, offset: 0, hideTournament: null, period: '-', tournament: tid });" +
+                                      "  postJson('/api/game/list', { dateFrom: null, dateTo: null, limit: 100, offset: 0, hideTournament: null, period: '+', tournament: tid });" +
+                                      "  var groups = document.querySelectorAll('details.standings-group');" +
+                                      "  for (var i = 0; i < groups.length; i++) {" +
+                                      "    var gid = parseInt(groups[i].getAttribute('data-standings-group'), 10);" +
+                                      "    if (gid) { postJson('/api/tournamentTable/list', { tournament: tid, group: gid }); }" +
                                       "  }" +
-                                      "} catch(e) {}" +
-                                      "})();"
-
-                                  val loadMatchesAndPlayersJs = "(function() {" +
-                                      "try {" +
-                                      "  var blueBtns = document.querySelectorAll('.people-scroll__page button, .button-blue');" +
-                                      "  for (var j = 0; j < blueBtns.length; j++) { blueBtns[j].click(); }" +
-                                      "  var tab4 = document.querySelector('.tournament-tab[data-tab=\"4\"]');" +
-                                      "  if (tab4) { tab4.click(); }" +
-                                      "  var panel4 = document.querySelector('#tournament-section-panel-4, [data-render-module=\"best-players-block\"]');" +
-                                      "  if (panel4) {" +
-                                      "    panel4.removeAttribute('hidden');" +
-                                      "    panel4.classList.add('active');" +
-                                      "    panel4.scrollIntoView();" +
-                                      "  }" +
+                                      "  postJson('/api/playerStatistic/list', { season: null, tournament: tid, group: null, limit: 15, nomination: 'bomber', role: null });" +
+                                      "  postJson('/api/playerStatistic/list', { season: null, tournament: tid, group: null, limit: 15, nomination: 'sniper', role: null });" +
+                                      "  postJson('/api/playerStatistic/list', { season: null, tournament: tid, group: null, limit: 15, nomination: 'bomber', role: 2 });" +
+                                      "  postJson('/api/playerStatistic/list', { season: null, tournament: tid, group: null, limit: 15, nomination: 'sniper', role: 2 });" +
+                                      "  postJson('/api/playerStatistic/list', { season: null, tournament: tid, group: null, limit: 15, nomination: 'assistant', role: null });" +
+                                      "  postJson('/api/playerStatistic/list', { season: null, tournament: tid, group: null, limit: 15, nomination: 'penalty', role: null });" +
+                                      "  postJson('/api/playerStatistic/list', { season: null, tournament: tid, group: null, limit: 15, nomination: 'goalkeeper', role: null });" +
                                       "} catch(e) {}" +
                                       "})();"
 
@@ -363,22 +372,6 @@ jobs:
                                       "})();"
 
                                   webView.webViewClient = object : WebViewClient() {
-                                      override fun shouldInterceptRequest(
-                                          view: WebView?,
-                                          request: WebResourceRequest?
-                                      ): WebResourceResponse? {
-                                          val reqUrl = request?.url?.toString() ?: ""
-                                          if (reqUrl.contains("/api/") || reqUrl.contains("/js/")) {
-                                              synchronized(interceptedUrls) {
-                                                  val entry = "${request?.method ?: "GET"} $reqUrl"
-                                                  if (!interceptedUrls.contains(entry) && interceptedUrls.size < 90) {
-                                                      interceptedUrls.add(entry)
-                                                  }
-                                              }
-                                          }
-                                          return super.shouldInterceptRequest(view, request)
-                                      }
-
                                       override fun onPageStarted(view: WebView?, loadedUrl: String?, favicon: Bitmap?) {
                                           super.onPageStarted(view, loadedUrl, favicon)
                                           view?.evaluateJavascript(hooksJs, null)
@@ -388,14 +381,14 @@ jobs:
                                           if (finished) return
                                           webView.evaluateJavascript(hooksJs, null)
 
+                                          // Через 0.8 сек запускаем пакетный запрос ко всем API эндпоинтам ФХМ
                                           mainHandler.postDelayed({
-                                              if (!finished && cont.isActive) webView.evaluateJavascript(openTablesJs, null)
-                                          }, 1000L)
+                                              if (!finished && cont.isActive) {
+                                                  webView.evaluateJavascript(directApiBatchJs, null)
+                                              }
+                                          }, 800L)
 
-                                          mainHandler.postDelayed({
-                                              if (!finished && cont.isActive) webView.evaluateJavascript(loadMatchesAndPlayersJs, null)
-                                          }, 2600L)
-
+                                          // Через 3.8 сек забираем все ответы
                                           mainHandler.postDelayed({
                                               if (!finished && cont.isActive) {
                                                   finished = true
@@ -426,12 +419,11 @@ jobs:
                                                       }
                                                       webView.destroy()
                                                       if (cont.isActive) {
-                                                          val netCopy = synchronized(interceptedUrls) { interceptedUrls.toList() }
-                                                          cont.resume(Triple(htmlOut, payloadsList, netCopy))
+                                                          cont.resume(Pair(htmlOut, payloadsList))
                                                       }
                                                   }
                                               }
-                                          }, 6000L)
+                                          }, 3800L)
                                       }
                                   }
 
@@ -444,16 +436,14 @@ jobs:
                                   webView.loadUrl(url)
                               }
                           }
-                      val netCopy = synchronized(interceptedUrls) { interceptedUrls.toList() }
-                      result ?: Triple("", emptyList(), netCopy)
+                      result ?: Pair("", emptyList())
                   }
               }
 
               private fun buildTournamentData(
                   doc: Document,
                   url: String,
-                  apiPayloads: List<Triple<String, String, String>>,
-                  interceptedUrls: List<String>
+                  apiPayloads: List<Triple<String, String, String>>
               ): TournamentPageData {
                   val h1 = doc.select("h1, h2").firstOrNull()?.text()?.trim() ?: "Кубок г. Москвы"
                   val upcomingMatches = mutableListOf<HockeyMatch>()
@@ -470,16 +460,27 @@ jobs:
                   }
 
                   val parsedStandingGroups = mutableListOf<StandingGroup>()
-                  val bestPlayers = mutableListOf<BestPlayerItem>()
+                  val playersMap = linkedMapOf<String, MutableList<BestPlayerItem>>(
+                      "Бомбардиры" to mutableListOf(),
+                      "Снайперы" to mutableListOf(),
+                      "Защитники-бомбардиры" to mutableListOf(),
+                      "Защитники-снайперы" to mutableListOf(),
+                      "Штрафники" to mutableListOf(),
+                      "Ассистенты" to mutableListOf(),
+                      "Вратари" to mutableListOf()
+                  )
+
+                  val samplePlayerStatJson = StringBuilder()
 
                   for (payload in apiPayloads) {
                       val apiUrl = payload.first
                       val reqBody = payload.second
                       val body = payload.third.trim()
-                      if (!body.startsWith("{") && !body.startsWith("[")) continue
+                      if (!body.startsWith("{")) continue
 
                       try {
-                          if (apiUrl.contains("/api/game/list") && body.startsWith("{")) {
+                          // 1. Матчи (/api/game/list)
+                          if (apiUrl.contains("/api/game/list")) {
                               val json = JSONObject(body)
                               val count = json.optInt("count", 0)
                               val items = json.optJSONArray("items")
@@ -498,7 +499,8 @@ jobs:
                               }
                           }
 
-                          if (apiUrl.contains("/api/tournamentTable/list") && body.startsWith("{")) {
+                          // 2. Таблицы (/api/tournamentTable/list)
+                          if (apiUrl.contains("/api/tournamentTable/list")) {
                               val json = JSONObject(body)
                               val items = json.optJSONArray("items")
                               if (items != null && items.length() > 0) {
@@ -533,6 +535,41 @@ jobs:
                                   }
                               }
                           }
+
+                          // 3. Статистика игроков (/api/playerStatistic/list)
+                          if (apiUrl.contains("/api/playerStatistic/list")) {
+                              val json = JSONObject(body)
+                              val items = json.optJSONArray("items")
+                              if (items != null && items.length() > 0) {
+                                  val reqJson = try { JSONObject(reqBody) } catch (e: Exception) { JSONObject() }
+                                  val nom = reqJson.optString("nomination", "")
+                                  val roleVal = if (reqJson.isNull("role")) 0 else reqJson.optInt("role", 0)
+
+                                  val categoryTitle = when {
+                                      nom == "bomber" && roleVal == 2 -> "Защитники-бомбардиры"
+                                      nom == "sniper" && roleVal == 2 -> "Защитники-снайперы"
+                                      nom == "bomber" -> "Бомбардиры"
+                                      nom == "sniper" -> "Снайперы"
+                                      nom == "penalty" -> "Штрафники"
+                                      nom == "assistant" -> "Ассистенты"
+                                      nom == "goalkeeper" -> "Вратари"
+                                      else -> "Бомбардиры"
+                                  }
+
+                                  val targetList = playersMap.getOrPut(categoryTitle) { mutableListOf() }
+
+                                  for (i in 0 until items.length()) {
+                                      val pObj = items.optJSONObject(i) ?: continue
+                                      if (samplePlayerStatJson.length < 2500) {
+                                          samplePlayerStatJson.append("[").append(categoryTitle).append("]: ").append(pObj.toString()).append("\n\n")
+                                      }
+                                      val parsedPlayer = parsePlayerStatItem(pObj, i + 1, categoryTitle)
+                                      if (targetList.none { it.id == parsedPlayer.id }) {
+                                          targetList.add(parsedPlayer)
+                                      }
+                                  }
+                              }
+                          }
                       } catch (e: Exception) {
                           // ignore
                       }
@@ -547,26 +584,20 @@ jobs:
                       }
                   }
 
-                  val payloadSummary = StringBuilder()
-                  for (idx in 0 until apiPayloads.size) {
-                      val p = apiPayloads[idx]
-                      payloadSummary.append("[").append(idx + 1).append("] URL: ").append(p.first)
-                          .append("\nREQ: ").append(p.second)
-                          .append("\nRESP: ").append(p.third.take(500)).append("\n\n")
-                  }
+                  // Оставляем только непустые категории игроков
+                  val nonEmptyPlayersMap = playersMap.filterValues { it.isNotEmpty() }
 
                   val report = buildString {
-                      appendLine("=== ОТЧЕТ ПАРСЕРА v3.0 ===")
+                      appendLine("=== ОТЧЕТ ПАРСЕРА v3.1 (FULL JSON API) ===")
                       appendLine("Турнир: $h1")
-                      appendLine("Групп таблиц: ${parsedStandingGroups.size}")
-                      parsedStandingGroups.forEach { g ->
-                          appendLine(" • ${g.groupName}: ${g.rows.size} команд (1 место: ${g.rows.firstOrNull()?.teamName})")
+                      appendLine("Матчей загружено: ${pastMatches.size} прошедших (всего $totalPast), ${upcomingMatches.size} будущих (всего $totalUpcoming)")
+                      appendLine("Групп таблицы: ${parsedStandingGroups.size}")
+                      appendLine("Категорий игроков: ${nonEmptyPlayersMap.size}")
+                      nonEmptyPlayersMap.forEach { (cat, list) ->
+                          appendLine(" • $cat: ${list.size} чел. (Лидер: ${list.firstOrNull()?.shortName} — ${list.firstOrNull()?.mainValue})")
                       }
-                      appendLine("Матчей: ${pastMatches.size} прошедших, ${upcomingMatches.size} будущих")
-                      appendLine("\n=== СЕТЕВЫЕ ЗАПРОСЫ ===")
-                      appendLine(interceptedUrls.joinToString("\n"))
-                      appendLine("\n=== API ПАРАМЕТРЫ (REQ / RESP) ===")
-                      appendLine(payloadSummary.toString())
+                      appendLine("\n=== ПОЛНЫЙ JSON ИГРОКОВ (/api/playerStatistic/list) ===")
+                      appendLine(samplePlayerStatJson.toString())
                   }
 
                   return TournamentPageData(
@@ -577,8 +608,75 @@ jobs:
                       upcomingMatches = upcomingMatches,
                       pastMatches = pastMatches,
                       standingGroups = parsedStandingGroups,
-                      bestPlayers = bestPlayers,
+                      playersByCategory = nonEmptyPlayersMap,
                       diagnosticReport = report
+                  )
+              }
+
+              private fun parsePlayerStatItem(
+                  pObj: JSONObject,
+                  rank: Int,
+                  categoryTitle: String
+              ): BestPlayerItem {
+                  val id = pObj.optString("id", "p_$rank")
+                  val surname = pObj.optString("surname", "")
+                  val name = pObj.optString("name", "")
+                  val patronymic = pObj.optString("patronymic", "")
+                  val fullName = "$surname $name $patronymic".trim()
+                  val shortName = "$surname $name".trim()
+
+                  val number = if (!pObj.isNull("number")) pObj.optString("number", "") else ""
+                  val roleName = pObj.optString("role", "")
+                  val birthDate = pObj.optString("dateOfBirth", "")
+                  val clubName = pObj.optString("clubName", "")
+                  val clubLogo = pObj.optString("clubPhoto", "")
+                  val photoUrl = if (!pObj.isNull("photo")) pObj.optString("photo", "") else ""
+
+                  val statObj = pObj.optJSONObject("statistics")
+                  var mainVal = ""
+                  val summaryParts = mutableListOf<String>()
+
+                  if (statObj != null) {
+                      val keys = statObj.keys()
+                      while (keys.hasNext()) {
+                          val k = keys.next()
+                          val v = statObj.opt(k)
+                          if (v != null && v.toString() != "null" && k != "nomination") {
+                              val label = when (k.lowercase()) {
+                                  "games", "game", "countgames" -> "И"
+                                  "goals", "goal", "pucks", "scored" -> "Г"
+                                  "assists", "assist", "passes" -> "П"
+                                  "points", "point", "score", "total", "value" -> "О"
+                                  "penalty", "penaltyminutes", "pim" -> "Штр"
+                                  else -> k
+                              }
+                              summaryParts.add("$label: $v")
+                              if (k.equals("value", true) || k.equals("score", true) || k.equals("points", true) || k.equals("goals", true) || k.equals("penalty", true)) {
+                                  mainVal = v.toString()
+                              }
+                          }
+                      }
+                      if (mainVal.isEmpty() && summaryParts.isNotEmpty()) {
+                          mainVal = summaryParts.last().substringAfter(": ")
+                      }
+                  }
+
+                  return BestPlayerItem(
+                      id = id,
+                      rank = rank,
+                      fullName = fullName,
+                      shortName = shortName,
+                      number = number,
+                      roleName = roleName,
+                      birthDate = birthDate,
+                      clubName = clubName,
+                      clubLogo = clubLogo,
+                      photoUrl = photoUrl.ifEmpty { clubLogo },
+                      categoryKey = categoryTitle,
+                      categoryTitle = categoryTitle,
+                      statSummary = summaryParts.joinToString("  •  "),
+                      mainValue = mainVal,
+                      rawStatJson = statObj?.toString() ?: "{}"
                   )
               }
 
@@ -670,33 +768,36 @@ jobs:
                               secondary = KhlIceBlue
                           )
                       ) {
-                          FhmKhlAppV30()
+                          FhmKhlAppV31()
                       }
                   }
               }
           }
 
           @Composable
-          fun FhmKhlAppV30() {
+          fun FhmKhlAppV31() {
               val context = LocalContext.current
               val scope = rememberCoroutineScope()
 
-              var bottomTab by remember { mutableIntStateOf(1) }
+              var bottomTab by remember { mutableIntStateOf(0) }
               var matchFilter by remember { mutableIntStateOf(1) }
               var selectedMatchGroup by remember { mutableStateOf("Все") }
               var selectedTableGroupIdx by remember { mutableIntStateOf(0) }
+              var selectedPlayerCatIdx by remember { mutableIntStateOf(0) }
               var tournamentId by remember { mutableStateOf("54") }
 
               var pageData by remember { mutableStateOf<TournamentPageData?>(null) }
               var isLoading by remember { mutableStateOf(true) }
               var selectedMatch by remember { mutableStateOf<HockeyMatch?>(null) }
               var selectedTeamRow by remember { mutableStateOf<StandingRow?>(null) }
+              var selectedPlayer by remember { mutableStateOf<BestPlayerItem?>(null) }
               var showTournamentPicker by remember { mutableStateOf(false) }
 
               fun reload() {
                   scope.launch {
                       isLoading = true
                       selectedTableGroupIdx = 0
+                      selectedPlayerCatIdx = 0
                       pageData = FhmTournamentParser.loadTournament(context, tournamentId)
                       isLoading = false
                   }
@@ -705,6 +806,7 @@ jobs:
               LaunchedEffect(tournamentId) { reload() }
 
               val totalLoadedMatches = (pageData?.upcomingMatches?.size ?: 0) + (pageData?.pastMatches?.size ?: 0)
+              val playerCategories = pageData?.playersByCategory?.keys?.toList() ?: emptyList()
 
               Scaffold(
                   containerColor = KhlBgDark,
@@ -725,7 +827,7 @@ jobs:
                                       Box(modifier = Modifier.size(9.dp).clip(CircleShape).background(KhlAccentRed))
                                       Spacer(modifier = Modifier.width(8.dp))
                                       Text(
-                                          text = "ФХМ v3.0 • ТУРНИР #$tournamentId (СМЕНИТЬ)",
+                                          text = "ФХМ v3.1 • ТУРНИР #$tournamentId",
                                           color = KhlIceBlue,
                                           fontSize = 11.sp,
                                           fontWeight = FontWeight.Bold
@@ -750,6 +852,7 @@ jobs:
                               }
                           }
 
+                          // Шапка для вкладки Матчи
                           if (bottomTab == 0) {
                               Row(
                                   modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
@@ -795,6 +898,7 @@ jobs:
                               }
                           }
 
+                          // Шапка для вкладки Таблица
                           if (bottomTab == 1) {
                               val groups = pageData?.standingGroups ?: emptyList()
                               if (groups.isNotEmpty()) {
@@ -814,6 +918,28 @@ jobs:
                                           ) {
                                               Text("${g.groupName} (${g.rows.size})", color = if (active) Color.White else KhlTextGray, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                                           }
+                                      }
+                                  }
+                              }
+                          }
+
+                          // Шапка для вкладки Игроки (Номинации)
+                          if (bottomTab == 2 && playerCategories.isNotEmpty()) {
+                              Row(
+                                  modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 6.dp),
+                                  horizontalArrangement = Arrangement.spacedBy(8.dp)
+                              ) {
+                                  for (idx in 0 until playerCategories.size) {
+                                      val catName = playerCategories[idx]
+                                      val active = selectedPlayerCatIdx == idx
+                                      Box(
+                                          modifier = Modifier
+                                              .clip(RoundedCornerShape(16.dp))
+                                              .background(if (active) KhlAccentRed else KhlBgDark)
+                                              .clickable { selectedPlayerCatIdx = idx }
+                                              .padding(horizontal = 14.dp, vertical = 6.dp)
+                                      ) {
+                                          Text(catName, color = if (active) Color.White else KhlTextGray, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                                       }
                                   }
                               }
@@ -838,7 +964,7 @@ jobs:
                               selected = bottomTab == 2,
                               onClick = { bottomTab = 2 },
                               icon = { Icon(Icons.Default.EmojiEvents, null) },
-                              label = { Text("Игроки") }
+                              label = { Text("Игроки (${playerCategories.size})") }
                           )
                           NavigationBarItem(
                               selected = bottomTab == 3,
@@ -855,7 +981,7 @@ jobs:
                               CircularProgressIndicator(color = KhlAccentRed)
                               Spacer(modifier = Modifier.height(12.dp))
                               Text(
-                                  text = "Загрузка таблиц Групп А, Б, В и матчей ФХМ...",
+                                  text = "Загрузка всех матчей, таблиц и лидеров ФХМ...",
                                   color = KhlTextGray,
                                   fontSize = 12.sp,
                                   textAlign = TextAlign.Center,
@@ -875,7 +1001,11 @@ jobs:
                                       val group = data.standingGroups.getOrNull(selectedTableGroupIdx)
                                       KhlStandingsScreen(group = group, onTeamClick = { selectedTeamRow = it })
                                   }
-                                  2 -> LivePlayersScreen(data)
+                                  2 -> {
+                                      val catKey = playerCategories.getOrNull(selectedPlayerCatIdx) ?: ""
+                                      val playersList = data.playersByCategory[catKey] ?: emptyList()
+                                      KhlPlayersScreen(players = playersList, onPlayerClick = { selectedPlayer = it })
+                                  }
                                   3 -> WebAndDomScreen(data)
                               }
                           }
@@ -922,6 +1052,44 @@ jobs:
                               showTournamentPicker = false
                           }) {
                               Text("Загрузить", color = KhlIceBlue)
+                          }
+                      }
+                  )
+              }
+
+              selectedPlayer?.let { p ->
+                  AlertDialog(
+                      onDismissRequest = { selectedPlayer = null },
+                      containerColor = KhlCardDark,
+                      title = {
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              AsyncImage(
+                                  model = p.photoUrl,
+                                  contentDescription = p.fullName,
+                                  contentScale = ContentScale.Fit,
+                                  modifier = Modifier.size(44.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.1f)).padding(4.dp)
+                              )
+                              Spacer(modifier = Modifier.width(10.dp))
+                              Column {
+                                  Text(p.fullName, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                                  Text("№${p.number} • ${p.roleName}", color = KhlIceBlue, fontSize = 12.sp)
+                              }
+                          }
+                      },
+                      text = {
+                          Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                              Text("Клуб: ${p.clubName}", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                              Text("Дата рождения: ${p.birthDate}", color = KhlTextGray, fontSize = 13.sp)
+                              Text("Номинация: ${p.categoryTitle}", color = KhlAccentRed, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                              if (p.statSummary.isNotEmpty()) {
+                                  Text("Показатели: ${p.statSummary}", color = KhlIceBlue, fontSize = 14.sp, fontWeight = FontWeight.Black)
+                              }
+                              Text("JSON statistics: ${p.rawStatJson}", color = KhlTextGray, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                          }
+                      },
+                      confirmButton = {
+                          TextButton(onClick = { selectedPlayer = null }) {
+                              Text("Закрыть", color = KhlIceBlue)
                           }
                       }
                   )
@@ -980,6 +1148,111 @@ jobs:
                           }
                       }
                   )
+              }
+          }
+
+          @Composable
+          fun KhlPlayersScreen(
+              players: List<BestPlayerItem>,
+              onPlayerClick: (BestPlayerItem) -> Unit
+          ) {
+              if (players.isEmpty()) {
+                  Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+                      Text("В этой номинации пока нет данных.", color = KhlTextGray, fontSize = 14.sp)
+                  }
+                  return
+              }
+
+              LazyColumn(contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                  items(players) { p ->
+                      Card(
+                          colors = CardDefaults.cardColors(containerColor = KhlCardDark),
+                          shape = RoundedCornerShape(14.dp),
+                          modifier = Modifier.fillMaxWidth().clickable { onPlayerClick(p) }
+                      ) {
+                          Row(
+                              modifier = Modifier.fillMaxWidth().padding(14.dp),
+                              verticalAlignment = Alignment.CenterVertically,
+                              horizontalArrangement = Arrangement.SpaceBetween
+                          ) {
+                              Row(
+                                  modifier = Modifier.weight(1f),
+                                  verticalAlignment = Alignment.CenterVertically
+                              ) {
+                                  Text(
+                                      text = "${p.rank}",
+                                      color = if (p.rank <= 3) KhlAccentRed else KhlTextGray,
+                                      fontWeight = FontWeight.Black,
+                                      fontSize = 16.sp,
+                                      modifier = Modifier.width(26.dp)
+                                  )
+                                  AsyncImage(
+                                      model = p.clubLogo,
+                                      contentDescription = p.clubName,
+                                      contentScale = ContentScale.Fit,
+                                      modifier = Modifier
+                                          .size(38.dp)
+                                          .clip(CircleShape)
+                                          .background(Color.White.copy(alpha = 0.08f))
+                                          .padding(4.dp)
+                                  )
+                                  Spacer(modifier = Modifier.width(10.dp))
+                                  Column(modifier = Modifier.weight(1f)) {
+                                      Row(verticalAlignment = Alignment.CenterVertically) {
+                                          Text(
+                                              text = p.shortName,
+                                              color = Color.White,
+                                              fontWeight = FontWeight.Bold,
+                                              fontSize = 14.sp,
+                                              maxLines = 1,
+                                              overflow = TextOverflow.Ellipsis
+                                          )
+                                          if (p.number.isNotEmpty()) {
+                                              Spacer(modifier = Modifier.width(6.dp))
+                                              Text(
+                                                  text = "#${p.number}",
+                                                  color = KhlIceBlue,
+                                                  fontWeight = FontWeight.Black,
+                                                  fontSize = 12.sp
+                                              )
+                                          }
+                                      }
+                                      Text(
+                                          text = "${p.clubName} • ${p.roleName}",
+                                          color = KhlTextGray,
+                                          fontSize = 12.sp,
+                                          maxLines = 1,
+                                          overflow = TextOverflow.Ellipsis
+                                      )
+                                      if (p.statSummary.isNotEmpty()) {
+                                          Text(
+                                              text = p.statSummary,
+                                              color = KhlIceBlue,
+                                              fontSize = 11.sp,
+                                              fontWeight = FontWeight.SemiBold
+                                          )
+                                      }
+                                  }
+                              }
+
+                              if (p.mainValue.isNotEmpty()) {
+                                  Box(
+                                      modifier = Modifier
+                                          .clip(RoundedCornerShape(8.dp))
+                                          .background(KhlBgDark)
+                                          .padding(horizontal = 12.dp, vertical = 6.dp)
+                                  ) {
+                                      Text(
+                                          text = p.mainValue,
+                                          color = KhlIceBlue,
+                                          fontWeight = FontWeight.Black,
+                                          fontSize = 18.sp
+                                      )
+                                  }
+                              }
+                          }
+                      }
+                  }
               }
           }
 
@@ -1110,18 +1383,6 @@ jobs:
               }
           }
 
-          @Composable
-          fun LivePlayersScreen(data: TournamentPageData) {
-              Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-                  Text(
-                      text = "Нажми сверху на название турнира, чтобы переключиться на старшие возраста (например, #50, #51, #52, #53), или открой вкладку «Веб / API».",
-                      color = KhlTextGray,
-                      fontSize = 14.sp,
-                      textAlign = TextAlign.Center
-                  )
-              }
-          }
-
           @SuppressLint("SetJavaScriptEnabled")
           @Composable
           fun WebAndDomScreen(data: TournamentPageData) {
@@ -1133,7 +1394,7 @@ jobs:
                       Button(
                           onClick = {
                               val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                              clipboard.setPrimaryClip(ClipData.newPlainText("FHM_V30", data.diagnosticReport))
+                              clipboard.setPrimaryClip(ClipData.newPlainText("FHM_V31", data.diagnosticReport))
                               Toast.makeText(context, "Скопировано!", Toast.LENGTH_LONG).show()
                           },
                           colors = ButtonDefaults.buttonColors(containerColor = KhlAccentRed),
@@ -1190,11 +1451,11 @@ jobs:
             exit 1
           }
 
-      - name: Rename APK to v3.0
-        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/fhm-khl-v30.apk
+      - name: Rename APK to v3.1
+        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/fhm-khl-v31.apk
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fhm-khl-v30
-          path: app/build/outputs/apk/debug/fhm-khl-v30.apk
+          name: fhm-khl-v31
+          path: app/build/outputs/apk/debug/fhm-khl-v31.apk
