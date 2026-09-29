@@ -31,16 +31,14 @@ jobs:
           mkdir -p app/src/main/java/com/fhm/khlstyle
           mkdir -p app/src/main/res/mipmap-xxxhdpi
 
-          # Скачиваем официальную иконку с сайта fhmoscow.com для ярлыка Android-приложения
           python3 -c '
           import urllib.request, re
           req = urllib.request.Request("https://fhmoscow.com/", headers={"User-Agent": "Mozilla/5.0"})
           html = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", "ignore")
-          m = re.search(r"href=[\"'\'']([^\"'\'']*(?:apple-touch-icon|favicon-32x32)[^\"'\'']*\.png[^\"'\'']*)", html)
+          m = re.search(r"href=[\"\x27]([^\"\x27]*(?:apple-touch-icon|favicon-32x32)[^\"\x27]*\.png[^\"\x27]*)", html)
           icon_url = m.group(1) if m else "https://fhmoscow.com/dist/releases/f607e3a7e98e97903485776be7a0b2d41afce96e/favicon/favicon-32x32.png"
           if icon_url.startswith("/"):
               icon_url = "https://fhmoscow.com" + icon_url
-          print("Downloading icon:", icon_url)
           data = urllib.request.urlopen(urllib.request.Request(icon_url, headers={"User-Agent": "Mozilla/5.0"}), timeout=10).read()
           open("app/src/main/res/mipmap-xxxhdpi/ic_launcher.png", "wb").write(data)
           ' || true
@@ -209,17 +207,8 @@ jobs:
           import org.jsoup.Connection
           import org.jsoup.Jsoup
 
-          // --- МОДЕЛИ ДАННЫХ ---
-          data class FhmSeasonOption(
-              val id: Int,
-              val name: String
-          )
-
-          data class FhmTournamentOption(
-              val id: Int,
-              val name: String,
-              val birthYear: String
-          )
+          data class FhmSeasonOption(val id: Int, val name: String)
+          data class FhmTournamentOption(val id: Int, val name: String, val birthYear: String)
 
           data class HockeyMatch(
               val id: String,
@@ -256,11 +245,7 @@ jobs:
               val groupName: String
           )
 
-          data class StandingGroup(
-              val groupId: Int,
-              val groupName: String,
-              val rows: List<StandingRow>
-          )
+          data class StandingGroup(val groupId: Int, val groupName: String, val rows: List<StandingRow>)
 
           data class BestPlayerItem(
               val id: String,
@@ -298,7 +283,6 @@ jobs:
               val tournamentsForSeason: List<FhmTournamentOption>
           )
 
-          // --- КЛИЕНТ ПРЯМОГО API FHMOSCOW.COM ---
           object FhmDirectApiClient {
               private const val BASE_URL = "https://fhmoscow.com"
               private const val DEFAULT_LOGO_URL =
@@ -358,15 +342,12 @@ jobs:
                           val o = arr.optJSONObject(i) ?: continue
                           val sid = o.optInt("id", o.optInt("value", 0))
                           val sName = o.optString("name", o.optString("title", o.optString("label", "")))
-                          if (sid > 0 && sName.isNotEmpty()) {
-                              list.add(FhmSeasonOption(sid, sName))
-                          }
+                          if (sid > 0 && sName.isNotEmpty()) list.add(FhmSeasonOption(sid, sName))
                       }
                       if (list.isNotEmpty()) cachedSeasons = list
                   }
 
                   val activeSeasonId = requestedSeasonId ?: cachedSeasons.firstOrNull()?.id ?: 0
-
                   val existingTournaments = cachedTournamentsBySeason[activeSeasonId]
                   if (!existingTournaments.isNullOrEmpty()) {
                       return Pair(activeSeasonId, existingTournaments)
@@ -388,9 +369,7 @@ jobs:
                       }
                   }
 
-                  if (tList.isNotEmpty()) {
-                      cachedTournamentsBySeason[activeSeasonId] = tList
-                  }
+                  if (tList.isNotEmpty()) cachedTournamentsBySeason[activeSeasonId] = tList
                   return Pair(activeSeasonId, tList)
               }
 
@@ -401,22 +380,16 @@ jobs:
                   val pageUrl = "$BASE_URL/tournament/$tournamentId"
 
                   val doc = try {
-                      Jsoup.connect(pageUrl)
-                          .userAgent(USER_AGENT)
-                          .timeout(8000)
-                          .get()
+                      Jsoup.connect(pageUrl).userAgent(USER_AGENT).timeout(8000).get()
                   } catch (e: Exception) {
                       null
                   }
 
                   val h1 = doc?.select("h1, h2")?.firstOrNull()?.text()?.trim() ?: "Турнир ФХМ #$tournamentId"
 
-                  // Извлекаем актуальную ссылку на логотип ФХМ с сайта
                   if (doc != null) {
                       val logoImg = doc.selectFirst("img[src*=logo]")?.attr("abs:src") ?: ""
-                      if (logoImg.isNotEmpty()) {
-                          cachedSiteLogo = logoImg
-                      }
+                      if (logoImg.isNotEmpty()) cachedSiteLogo = logoImg
                   }
 
                   val groupDefs = mutableListOf<Pair<Int, String>>()
@@ -425,26 +398,17 @@ jobs:
                       for (dEl in detailsEls) {
                           val gid = dEl.attr("data-standings-group").toIntOrNull()
                           val gName = dEl.select("summary span").firstOrNull()?.text()?.trim() ?: "Группа"
-                          if (gid != null) {
-                              groupDefs.add(Pair(gid, gName))
-                          }
+                          if (gid != null) groupDefs.add(Pair(gid, gName))
                       }
                   }
 
                   coroutineScope {
                       val catalogJob = async { fetchSeasonsAndTournaments(seasonId, pageUrl) }
-
-                      val pastJobs = listOf(0, 8, 16).map { offset ->
-                          async { fetchGamesPage(tournamentId, "-", offset, pageUrl) }
-                      }
-                      val upcomingJobs = listOf(0, 8, 16).map { offset ->
-                          async { fetchGamesPage(tournamentId, "+", offset, pageUrl) }
-                      }
+                      val pastJobs = listOf(0, 8, 16).map { offset -> async { fetchGamesPage(tournamentId, "-", offset, pageUrl) } }
+                      val upcomingJobs = listOf(0, 8, 16).map { offset -> async { fetchGamesPage(tournamentId, "+", offset, pageUrl) } }
 
                       val tableJobs = if (groupDefs.isNotEmpty()) {
-                          groupDefs.map { (gid, gName) ->
-                              async { fetchStandingGroup(tournamentId, gid, gName, pageUrl) }
-                          }
+                          groupDefs.map { (gid, gName) -> async { fetchStandingGroup(tournamentId, gid, gName, pageUrl) } }
                       } else {
                           listOf(async { fetchStandingGroup(tournamentId, null, "Турнирная таблица", pageUrl) })
                       }
@@ -477,12 +441,9 @@ jobs:
 
                       val playersMap = linkedMapOf<String, List<BestPlayerItem>>()
                       for ((title, list) in playerResults) {
-                          if (list.isNotEmpty()) {
-                              playersMap[title] = list
-                          }
+                          if (list.isNotEmpty()) playersMap[title] = list
                       }
 
-                      // Если API-фильтр не вернул список, добавляем текущий турнир и найденные на странице ссылки
                       val finalTournaments = if (catalogTournaments.isNotEmpty()) {
                           catalogTournaments
                       } else {
@@ -523,27 +484,18 @@ jobs:
                   fetchSeasonsAndTournaments(seasonId, BASE_URL).second
               }
 
-              suspend fun loadMoreMatches(
-                  tournamentId: Int,
-                  period: String,
-                  currentOffset: Int
-              ): List<HockeyMatch> = withContext(Dispatchers.IO) {
+              suspend fun loadMoreMatches(tournamentId: Int, period: String, currentOffset: Int): List<HockeyMatch> = withContext(Dispatchers.IO) {
                   val pageUrl = "$BASE_URL/tournament/$tournamentId"
                   coroutineScope {
                       val offsets = listOf(currentOffset, currentOffset + 8, currentOffset + 16)
-                      val jobs = offsets.map { off ->
-                          async { fetchGamesPage(tournamentId, period, off, pageUrl).second }
-                      }
-                      jobs.awaitAll().flatten().distinctBy { it.id }
+                      offsets.map { off -> async { fetchGamesPage(tournamentId, period, off, pageUrl).second } }
+                          .awaitAll()
+                          .flatten()
+                          .distinctBy { it.id }
                   }
               }
 
-              private fun fetchGamesPage(
-                  tournamentId: Int,
-                  period: String,
-                  offset: Int,
-                  referer: String
-              ): Pair<Int, List<HockeyMatch>> {
+              private fun fetchGamesPage(tournamentId: Int, period: String, offset: Int, referer: String): Pair<Int, List<HockeyMatch>> {
                   val req = JSONObject().apply {
                       put("dateFrom", JSONObject.NULL)
                       put("dateTo", JSONObject.NULL)
@@ -571,12 +523,7 @@ jobs:
                   }
               }
 
-              private fun fetchStandingGroup(
-                  tournamentId: Int,
-                  groupId: Int?,
-                  groupName: String,
-                  referer: String
-              ): StandingGroup {
+              private fun fetchStandingGroup(tournamentId: Int, groupId: Int?, groupName: String, referer: String): StandingGroup {
                   val req = JSONObject().apply {
                       put("tournament", tournamentId)
                       if (groupId != null) put("group", groupId) else put("group", JSONObject.NULL)
@@ -617,13 +564,7 @@ jobs:
                   }
               }
 
-              private fun fetchPlayersCategory(
-                  tournamentId: Int,
-                  categoryTitle: String,
-                  nomination: String,
-                  role: Int?,
-                  referer: String
-              ): List<BestPlayerItem> {
+              private fun fetchPlayersCategory(tournamentId: Int, categoryTitle: String, nomination: String, role: Int?, referer: String): List<BestPlayerItem> {
                   val req = JSONObject().apply {
                       put("season", JSONObject.NULL)
                       put("tournament", tournamentId)
@@ -649,12 +590,7 @@ jobs:
                   }
               }
 
-              private fun parsePlayerStatItem(
-                  pObj: JSONObject,
-                  rank: Int,
-                  categoryTitle: String,
-                  nomination: String
-              ): BestPlayerItem {
+              private fun parsePlayerStatItem(pObj: JSONObject, rank: Int, categoryTitle: String, nomination: String): BestPlayerItem {
                   val id = pObj.optString("id", "p_$rank")
                   val surname = pObj.optString("surname", "").trim()
                   val name = pObj.optString("name", "").trim()
@@ -790,7 +726,6 @@ jobs:
               val context = LocalContext.current
               val scope = rememberCoroutineScope()
 
-              // Декодер для векторного логотипа ФХМ (logo.svg)
               val svgImageLoader = remember {
                   ImageLoader.Builder(context)
                       .components { add(SvgDecoder.Factory()) }
@@ -860,7 +795,6 @@ jobs:
                   pageData?.standingGroups?.flatMap { it.rows } ?: emptyList()
               }
 
-              // Группируем турниры сезона по годам рождения (2009..2017) для быстрого выбора года в шапке
               val tournamentsList = pageData?.tournamentsForSeason ?: emptyList()
               val birthYearsAvailable = remember(tournamentsList) {
                   tournamentsList.map { it.birthYear }.filter { it.isNotEmpty() }.distinct().sortedDescending()
@@ -880,16 +814,13 @@ jobs:
                               .background(KhlCardDark)
                               .padding(top = 10.dp, bottom = 8.dp)
                       ) {
-                          // Верхняя панель с логотипом ФХМ и названием турнира
                           Row(
                               modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp),
                               horizontalArrangement = Arrangement.SpaceBetween,
                               verticalAlignment = Alignment.CenterVertically
                           ) {
                               Row(
-                                  modifier = Modifier
-                                      .weight(1f)
-                                      .clickable { showTournamentPicker = true },
+                                  modifier = Modifier.weight(1f).clickable { showTournamentPicker = true },
                                   verticalAlignment = Alignment.CenterVertically
                               ) {
                                   AsyncImage(
@@ -935,7 +866,6 @@ jobs:
                               }
                           }
 
-                          // Полоса быстрого выбора ГОДА РОЖДЕНИЯ (2017, 2016, 2015, 2014, 2013, 2012...)
                           Row(
                               modifier = Modifier
                                   .fillMaxWidth()
@@ -959,57 +889,39 @@ jobs:
                                   )
                               }
 
-                              if (birthYearsAvailable.isNotEmpty()) {
-                                  birthYearsAvailable.forEach { yr ->
-                                      val isSelectedYear = yr == currentBirthYear
-                                      Box(
-                                          modifier = Modifier
-                                              .clip(RoundedCornerShape(14.dp))
-                                              .background(if (isSelectedYear) KhlAccentRed else KhlBgDark)
-                                              .clickable {
-                                                  val matchingTournaments = tournamentsList.filter { it.birthYear == yr }
-                                                  if (matchingTournaments.size == 1) {
-                                                      tournamentId = matchingTournaments.first().id
-                                                  } else if (matchingTournaments.size > 1) {
-                                                      // Если у этого года несколько турниров, переключаем на следующий или открываем выбор
-                                                      val nextT = matchingTournaments.firstOrNull { it.id != tournamentId } ?: matchingTournaments.first()
-                                                      tournamentId = nextT.id
-                                                  }
-                                              }
-                                              .padding(horizontal = 12.dp, vertical = 5.dp)
-                                      ) {
-                                          Text(
-                                              text = "$yr г.р.",
-                                              color = if (isSelectedYear) Color.White else KhlTextGray,
-                                              fontSize = 12.sp,
-                                              fontWeight = FontWeight.Bold
-                                          )
-                                      }
-                                  }
+                              val yearsToRender = if (birthYearsAvailable.isNotEmpty()) {
+                                  birthYearsAvailable
                               } else {
-                                  // Если список годов еще грузится, показываем быстрые кнопки
-                                  val fallbackYears = listOf("2017", "2016", "2015", "2014", "2013", "2012", "2011", "2010", "2009")
-                                  fallbackYears.forEach { yr ->
-                                      val isSel = currentBirthYear == yr
-                                      Box(
-                                          modifier = Modifier
-                                              .clip(RoundedCornerShape(14.dp))
-                                              .background(if (isSel) KhlAccentRed else KhlBgDark)
-                                              .clickable { showTournamentPicker = true }
-                                              .padding(horizontal = 12.dp, vertical = 5.dp)
-                                      ) {
-                                          Text(
-                                              text = "$yr г.р.",
-                                              color = if (isSel) Color.White else KhlTextGray,
-                                              fontSize = 12.sp,
-                                              fontWeight = FontWeight.Bold
-                                          )
-                                      }
+                                  listOf("2017", "2016", "2015", "2014", "2013", "2012", "2011", "2010", "2009")
+                              }
+
+                              yearsToRender.forEach { yr ->
+                                  val isSelectedYear = yr == currentBirthYear
+                                  Box(
+                                      modifier = Modifier
+                                          .clip(RoundedCornerShape(14.dp))
+                                          .background(if (isSelectedYear) KhlAccentRed else KhlBgDark)
+                                          .clickable {
+                                              val matchingTournaments = tournamentsList.filter { it.birthYear == yr }
+                                              if (matchingTournaments.isNotEmpty()) {
+                                                  val nextT = matchingTournaments.firstOrNull { it.id != tournamentId } ?: matchingTournaments.first()
+                                                  tournamentId = nextT.id
+                                              } else {
+                                                  showTournamentPicker = true
+                                              }
+                                          }
+                                          .padding(horizontal = 12.dp, vertical = 5.dp)
+                                  ) {
+                                      Text(
+                                          text = "$yr г.р.",
+                                          color = if (isSelectedYear) Color.White else KhlTextGray,
+                                          fontSize = 12.sp,
+                                          fontWeight = FontWeight.Bold
+                                      )
                                   }
                               }
                           }
 
-                          // Фильтры для вкладки 0 (Матчи)
                           if (bottomTab == 0) {
                               Row(
                                   modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
@@ -1076,7 +988,6 @@ jobs:
                               }
                           }
 
-                          // Фильтры для вкладки 1 (Таблица)
                           if (bottomTab == 1) {
                               val groups = pageData?.standingGroups ?: emptyList()
                               if (groups.size > 1) {
@@ -1101,7 +1012,6 @@ jobs:
                               }
                           }
 
-                          // Фильтры для вкладки 2 (Лидеры)
                           if (bottomTab == 2 && playerCategories.isNotEmpty()) {
                               Row(
                                   modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 4.dp),
@@ -1220,7 +1130,6 @@ jobs:
                   }
               }
 
-              // Модальное окно выбора Сезона, Года рождения и Турнира
               if (showTournamentPicker) {
                   var dialogSeasonId by remember { mutableIntStateOf(pageData?.selectedSeasonId ?: 0) }
                   var dialogTournaments by remember { mutableStateOf(pageData?.tournamentsForSeason ?: emptyList()) }
@@ -1241,12 +1150,9 @@ jobs:
                   AlertDialog(
                       onDismissRequest = { showTournamentPicker = false },
                       containerColor = KhlCardDark,
-                      title = {
-                          Text("Выбор сезона, года и турнира", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                      },
+                      title = { Text("Выбор сезона, года и турнира", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold) },
                       text = {
                           Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                              // Селектор сезона (26/27, 25/26, 24/25...)
                               if (seasonsList.isNotEmpty()) {
                                   Text("Сезон:", color = KhlTextGray, fontSize = 11.sp)
                                   Row(
@@ -1274,7 +1180,6 @@ jobs:
                                   }
                               }
 
-                              // Фильтр по году рождения внутри диалога
                               if (dialogYears.size > 1) {
                                   Text("Год рождения:", color = KhlTextGray, fontSize = 11.sp)
                                   Row(
@@ -1334,7 +1239,6 @@ jobs:
                   )
               }
 
-              // Досье игрока
               selectedPlayer?.let { p ->
                   AlertDialog(
                       onDismissRequest = { selectedPlayer = null },
@@ -1358,11 +1262,7 @@ jobs:
                       text = {
                           Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                               Row(verticalAlignment = Alignment.CenterVertically) {
-                                  AsyncImage(
-                                      model = p.clubLogo,
-                                      contentDescription = p.clubName,
-                                      modifier = Modifier.size(24.dp)
-                                  )
+                                  AsyncImage(model = p.clubLogo, contentDescription = p.clubName, modifier = Modifier.size(24.dp))
                                   Spacer(modifier = Modifier.width(8.dp))
                                   Text(p.clubName, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                               }
@@ -1397,7 +1297,6 @@ jobs:
                   )
               }
 
-              // Карточка команды
               selectedTeamRow?.let { row ->
                   AlertDialog(
                       onDismissRequest = { selectedTeamRow = null },
@@ -1455,7 +1354,6 @@ jobs:
                   )
               }
 
-              // Протокол матча
               selectedMatch?.let { match ->
                   AlertDialog(
                       onDismissRequest = { selectedMatch = null },
