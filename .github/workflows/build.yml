@@ -1,4 +1,4 @@
-name: Build FHM v2.4 APK
+name: Build FHM v2.5 APK
 
 on:
   push:
@@ -25,7 +25,7 @@ jobs:
           unzip -q gradle-8.7-bin.zip -d /tmp
           echo "/tmp/gradle-8.7/bin" >> $GITHUB_PATH
 
-      - name: Generate v2.4 project
+      - name: Generate v2.5 project
         run: |
           rm -rf app settings.gradle.kts build.gradle.kts gradle.properties
           mkdir -p app/src/main/java/com/fhm/khlstyle
@@ -45,7 +45,7 @@ jobs:
                   mavenCentral()
               }
           }
-          rootProject.name = "FHM_KHL_V24"
+          rootProject.name = "FHM_KHL_V25"
           include(":app")
           EOF
 
@@ -77,8 +77,8 @@ jobs:
                   applicationId = "com.fhm.khlstyle"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 24
-                  versionName = "2.4"
+                  versionCode = 25
+                  versionName = "2.5"
               }
 
               buildTypes {
@@ -121,7 +121,7 @@ jobs:
               <application
                   android:allowBackup="false"
                   android:icon="@android:drawable/sym_def_app_icon"
-                  android:label="ФХМ 54 (v2.4)"
+                  android:label="ФХМ 54 (v2.5)"
                   android:supportsRtl="true"
                   android:usesCleartextTraffic="true"
                   android:theme="@android:style/Theme.Material.NoActionBar">
@@ -147,8 +147,6 @@ jobs:
           import android.os.Bundle
           import android.os.Handler
           import android.os.Looper
-          import android.webkit.WebResourceRequest
-          import android.webkit.WebResourceResponse
           import android.webkit.WebView
           import android.webkit.WebViewClient
           import android.widget.Toast
@@ -194,7 +192,6 @@ jobs:
           import org.json.JSONTokener
           import org.jsoup.Jsoup
           import org.jsoup.nodes.Document
-          import java.util.Collections
           import kotlin.coroutines.resume
 
           data class HockeyMatch(
@@ -209,7 +206,6 @@ jobs:
 
           data class ParsedTable(
               val title: String,
-              val subtitle: String,
               val headers: List<String>,
               val rows: List<List<String>>
           )
@@ -229,9 +225,8 @@ jobs:
               suspend fun loadTournament(
                   context: Context,
                   tournamentId: String,
-                  actionMode: Int // 0 = Матчи, 1 = Таблица, 2 = Лучшие игроки
+                  actionMode: Int
               ): TournamentPageData {
-                  // На сайте ФХМ: data-tab="1" (Матчи), data-tab="2" (Таблица), data-tab="4" (Лучшие игроки)
                   val tabParam = when (actionMode) {
                       0 -> 1
                       1 -> 2
@@ -241,7 +236,7 @@ jobs:
 
                   val pairResult = fetchInteractiveDomViaWebView(context, targetUrl, actionMode)
                   val renderedHtml = pairResult.first
-                  val networkUrls = pairResult.second
+                  val apiLogs = pairResult.second
 
                   if (renderedHtml.isEmpty()) {
                       return TournamentPageData(
@@ -250,12 +245,59 @@ jobs:
                           matches = emptyList(),
                           tables = emptyList(),
                           playerRows = emptyList(),
-                          diagnosticReport = "Таймаут ожидания DOM страницы $targetUrl\nПерехваченные запросы:\n$networkUrls"
+                          diagnosticReport = "Не удалось получить DOM страницы $targetUrl"
                       )
                   }
 
                   val doc = Jsoup.parse(renderedHtml, targetUrl)
-                  return parseFhmSpaDocument(doc, targetUrl, actionMode, networkUrls)
+
+                  // Скачиваем и анализируем JS-бандл сайта ФХМ, чтобы увидеть внутренние URL подгрузки таблиц и матчей
+                  val jsBundleReport = withContext(Dispatchers.IO) {
+                      val sb = StringBuilder()
+                      try {
+                          val scripts = doc.select("script[src]")
+                          for (s in scripts) {
+                              val src = s.attr("abs:src")
+                              if (src.contains("app.")) {
+                                  sb.append("JS Bundle URL: ").append(src).append("\n")
+                                  val jsBody = Jsoup.connect(src)
+                                      .userAgent("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36")
+                                      .ignoreContentType(true)
+                                      .maxBodySize(0)
+                                      .timeout(10000)
+                                      .execute()
+                                      .body()
+                                  sb.append("Размер JS: ").append(jsBody.length).append(" символов\n")
+
+                                  val keywords = listOf(
+                                      "standings-content",
+                                      "standings-group",
+                                      "tournament-table",
+                                      "match-cards",
+                                      "best-players-block",
+                                      "people-scroll"
+                                  )
+                                  for (kw in keywords) {
+                                      var pos = jsBody.indexOf(kw)
+                                      var count = 0
+                                      while (pos >= 0 && count < 2) {
+                                          val start = if (pos > 160) pos - 160 else 0
+                                          val end = if (pos + 340 < jsBody.length) pos + 340 else jsBody.length
+                                          sb.append("\n--- КОД МОДУЛЯ [").append(kw).append(" #").append(count + 1).append("] ---\n")
+                                          sb.append(jsBody.substring(start, end)).append("\n")
+                                          pos = jsBody.indexOf(kw, pos + kw.length)
+                                          count++
+                                      }
+                                  }
+                              }
+                          }
+                      } catch (e: Exception) {
+                          sb.append("Ошибка чтения JS: ").append(e.localizedMessage ?: "err")
+                      }
+                      sb.toString()
+                  }
+
+                  return parseFhmSpaDocument(doc, targetUrl, actionMode, apiLogs, jsBundleReport)
               }
 
               @SuppressLint("SetJavaScriptEnabled")
@@ -265,157 +307,97 @@ jobs:
                   actionMode: Int
               ): Pair<String, String> {
                   return withContext(Dispatchers.Main) {
-                      val interceptedUrls = Collections.synchronizedList(mutableListOf<String>())
-
-                      val result: Pair<String, String>? = withTimeoutOrNull<Pair<String, String>>(28000L) {
+                      val result: Pair<String, String>? = withTimeoutOrNull<Pair<String, String>>(24000L) {
                           suspendCancellableCoroutine<Pair<String, String>> { cont ->
                               val webView = WebView(context)
-                              webView.layout(0, 0, 1080, 2400)
                               webView.settings.javaScriptEnabled = true
                               webView.settings.domStorageEnabled = true
                               webView.settings.userAgentString =
                                   "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
                               var finished = false
-                              var pageReadyTriggered = false
                               val mainHandler = Handler(Looper.getMainLooper())
 
-                              // Скрипт, который кликает по нужным элементам ФХМ и заставляет модули отрендерить контент
-                              val triggerJs = "(function() {" +
-                                  "try {" +
-                                  "  var consentBtns = document.querySelectorAll('.consent-button, [data-consent-accept]');" +
-                                  "  if (consentBtns.length > 0) { consentBtns[0].click(); }" +
-                                  "  var mode = " + actionMode + ";" +
-                                  "  var targetTab = (mode === 0) ? '1' : ((mode === 1) ? '2' : '4');" +
-                                  "  var tabBtn = document.querySelector('.tournament-tab[data-tab=\"' + targetTab + '\"]') || document.querySelectorAll('.tournament-tab')[mode];" +
-                                  "  if (tabBtn) { tabBtn.click(); }" +
-                                  "  if (mode === 0) {" +
-                                  "    var mTab2 = document.querySelector('#tournament-match-tab-2, .match-tab[data-tab=\"2\"]');" +
-                                  "    if (mTab2) { mTab2.click(); }" +
-                                  "    var blueBtns = document.querySelectorAll('.people-scroll__page button, .button-blue');" +
-                                  "    for (var b = 0; b < blueBtns.length; b++) { blueBtns[b].click(); }" +
-                                  "    window.scrollTo(0, 800);" +
+                              val hooksJs = "(function() {" +
+                                  "window.__fhmApiCalls = window.__fhmApiCalls || [];" +
+                                  "if (!window.__fhmHooked) {" +
+                                  "  window.__fhmHooked = true;" +
+                                  "  var origFetch = window.fetch;" +
+                                  "  if (origFetch) {" +
+                                  "    window.fetch = function() {" +
+                                  "      var u = arguments[0];" +
+                                  "      return origFetch.apply(this, arguments).then(function(resp) {" +
+                                  "        try { resp.clone().text().then(function(txt) { window.__fhmApiCalls.push('FETCH: ' + u + ' -> ' + txt.substring(0, 300)); }); } catch(e) {}" +
+                                  "        return resp;" +
+                                  "      });" +
+                                  "    };" +
                                   "  }" +
-                                  "  var summaries = document.querySelectorAll('details.standings-group > summary');" +
-                                  "  for (var i = 0; i < summaries.length; i++) {" +
-                                  "    var det = summaries[i].parentElement;" +
-                                  "    if (det && !det.hasAttribute('open')) {" +
-                                  "      summaries[i].click();" +
-                                  "      det.setAttribute('open', 'true');" +
-                                  "      det.dispatchEvent(new Event('toggle'));" +
-                                  "    } else if (det) {" +
-                                  "      det.dispatchEvent(new Event('toggle'));" +
-                                  "    }" +
-                                  "  }" +
-                                  "  if (mode === 2) {" +
-                                  "    var sel = document.querySelector('[data-group-select]');" +
-                                  "    if (sel && sel.options.length > 1) {" +
-                                  "      sel.value = sel.options[1].value;" +
-                                  "      sel.dispatchEvent(new Event('change', { bubbles: true }));" +
-                                  "    }" +
-                                  "  }" +
-                                  "} catch(e) {}" +
+                                  "  var origOpen = XMLHttpRequest.prototype.open;" +
+                                  "  XMLHttpRequest.prototype.open = function(m, u) { this._url = u; return origOpen.apply(this, arguments); };" +
+                                  "  var origSend = XMLHttpRequest.prototype.send;" +
+                                  "  XMLHttpRequest.prototype.send = function() {" +
+                                  "    var self = this;" +
+                                  "    this.addEventListener('load', function() {" +
+                                  "      try { window.__fhmApiCalls.push('XHR: ' + self._url + ' -> ' + (self.responseText || '').substring(0, 300)); } catch(e) {}" +
+                                  "    });" +
+                                  "    return origSend.apply(this, arguments);" +
+                                  "  };" +
+                                  "}" +
                                   "})();"
 
-                              val checkAndDumpJs = "(function() {" +
-                                  "var stContent = document.querySelectorAll('[data-standings-content]');" +
-                                  "var filledGroups = 0;" +
-                                  "var totalStLen = 0;" +
-                                  "for (var i = 0; i < stContent.length; i++) {" +
-                                  "  var h = stContent[i].innerHTML.trim();" +
-                                  "  totalStLen += h.length;" +
-                                  "  if (h.length > 30) filledGroups++;" +
+                              val clickJs = "(function() {" +
+                                  "var mode = " + actionMode + ";" +
+                                  "var tTabs = document.querySelectorAll('.tournament-tab');" +
+                                  "if (tTabs.length > mode) { tTabs[mode].click(); }" +
+                                  "if (mode === 0) {" +
+                                  "  var mTabs = document.querySelectorAll('.match-tab');" +
+                                  "  if (mTabs.length > 1) { mTabs[1].click(); }" +
                                   "}" +
-                                  "var matchPages = document.querySelectorAll('.people-scroll__page');" +
-                                  "var matchHtmlLen = 0;" +
-                                  "for (var j = 0; j < matchPages.length; j++) {" +
-                                  "  matchHtmlLen += matchPages[j].innerHTML.length;" +
-                                  "}" +
-                                  "var bestBlock = document.querySelector('[data-render-module=\"best-players-block\"]');" +
-                                  "var bestLen = bestBlock ? bestBlock.innerHTML.length : 0;" +
-                                  "var blueBtns = document.querySelectorAll('.people-scroll__page button.button-blue');" +
-                                  "for (var b = 0; b < blueBtns.length; b++) { try { blueBtns[b].click(); } catch(e) {} }" +
-                                  "return JSON.stringify({" +
-                                  "  filledGroups: filledGroups," +
-                                  "  totalStLen: totalStLen," +
-                                  "  matchHtmlLen: matchHtmlLen," +
-                                  "  bestLen: bestLen," +
-                                  "  html: document.documentElement.outerHTML" +
-                                  "});" +
+                                  "var summaries = document.querySelectorAll('details.standings-group > summary');" +
+                                  "for (var i = 0; i < summaries.length; i++) { try { summaries[i].click(); } catch(e) {} }" +
+                                  "var blueBtns = document.querySelectorAll('button.button-blue');" +
+                                  "for (var j = 0; j < blueBtns.length; j++) { try { blueBtns[j].click(); } catch(e) {} }" +
                                   "})();"
 
-                              fun pollDom(attempt: Int) {
-                                  if (finished || !cont.isActive) return
-                                  webView.evaluateJavascript(checkAndDumpJs) { rawJson ->
-                                      if (finished || !cont.isActive) return@evaluateJavascript
-                                      var htmlOut = ""
-                                      var filledGroups = 0
-                                      var totalStLen = 0
-                                      var matchHtmlLen = 0
-                                      try {
-                                          if (rawJson != null && rawJson != "null") {
-                                              val unquoted = JSONTokener(rawJson).nextValue()?.toString() ?: ""
-                                              val obj = JSONObject(unquoted)
-                                              filledGroups = obj.optInt("filledGroups", 0)
-                                              totalStLen = obj.optInt("totalStLen", 0)
-                                              matchHtmlLen = obj.optInt("matchHtmlLen", 0)
-                                              htmlOut = obj.optString("html", "")
-                                          }
-                                      } catch (e: Exception) {
-                                          htmlOut = ""
-                                      }
-
-                                      val enoughData = (actionMode == 1 && totalStLen > 100) ||
-                                          (actionMode == 0 && matchHtmlLen > 400) ||
-                                          (attempt >= 8)
-
-                                      if (enoughData && htmlOut.isNotEmpty()) {
-                                          finished = true
-                                          webView.destroy()
-                                          val netLog = synchronized(interceptedUrls) {
-                                              interceptedUrls.joinToString("\n")
-                                          }
-                                          cont.resume(Pair(htmlOut, netLog))
-                                      } else {
-                                          // Повторяем триггер и проверяем снова через 1.2 секунды
-                                          webView.evaluateJavascript(triggerJs, null)
-                                          mainHandler.postDelayed({ pollDom(attempt + 1) }, 1200L)
-                                      }
-                                  }
-                              }
+                              val dumpJs = "(function() {" +
+                                  "var logs = (window.__fhmApiCalls || []).join('\\n===\\n');" +
+                                  "return JSON.stringify({ html: document.documentElement.outerHTML, logs: logs });" +
+                                  "})();"
 
                               webView.webViewClient = object : WebViewClient() {
-                                  override fun shouldInterceptRequest(
-                                      view: WebView?,
-                                      request: WebResourceRequest?
-                                  ): WebResourceResponse? {
-                                      val reqUrl = request?.url?.toString() ?: ""
-                                      if (reqUrl.isNotEmpty() &&
-                                          !reqUrl.endsWith(".png") &&
-                                          !reqUrl.endsWith(".svg") &&
-                                          !reqUrl.endsWith(".woff2") &&
-                                          !reqUrl.endsWith(".css")
-                                      ) {
-                                          synchronized(interceptedUrls) {
-                                              val entry = "${request?.method ?: "GET"} $reqUrl"
-                                              if (!interceptedUrls.contains(entry) && interceptedUrls.size < 60) {
-                                                  interceptedUrls.add(entry)
-                                              }
-                                          }
-                                      }
-                                      return super.shouldInterceptRequest(view, request)
-                                  }
-
                                   override fun onPageFinished(view: WebView?, loadedUrl: String?) {
-                                      if (pageReadyTriggered || finished) return
-                                      pageReadyTriggered = true
+                                      if (finished) return
+                                      webView.evaluateJavascript(hooksJs, null)
 
                                       mainHandler.postDelayed({
                                           if (!finished && cont.isActive) {
-                                              webView.evaluateJavascript(triggerJs, null)
-                                              mainHandler.postDelayed({ pollDom(1) }, 1500L)
+                                              webView.evaluateJavascript(clickJs, null)
                                           }
                                       }, 1200L)
+
+                                      mainHandler.postDelayed({
+                                          if (!finished && cont.isActive) {
+                                              finished = true
+                                              webView.evaluateJavascript(dumpJs) { rawJson ->
+                                                  var htmlOut = ""
+                                                  var logsOut = ""
+                                                  try {
+                                                      if (rawJson != null) {
+                                                          val unquoted = JSONTokener(rawJson).nextValue()?.toString() ?: ""
+                                                          val obj = JSONObject(unquoted)
+                                                          htmlOut = obj.optString("html", "")
+                                                          logsOut = obj.optString("logs", "")
+                                                      }
+                                                  } catch (e: Exception) {
+                                                      htmlOut = ""
+                                                  }
+                                                  webView.destroy()
+                                                  if (cont.isActive) {
+                                                      cont.resume(Pair(htmlOut, logsOut))
+                                                  }
+                                              }
+                                          }
+                                      }, 5500L)
                                   }
                               }
 
@@ -428,8 +410,7 @@ jobs:
                               webView.loadUrl(url)
                           }
                       }
-                      val netLog = synchronized(interceptedUrls) { interceptedUrls.joinToString("\n") }
-                      result ?: Pair("", netLog)
+                      result ?: Pair("", "")
                   }
               }
 
@@ -437,129 +418,118 @@ jobs:
                   doc: Document,
                   url: String,
                   actionMode: Int,
-                  networkUrls: String
+                  apiLogs: String,
+                  jsBundleReport: String
               ): TournamentPageData {
                   val h1 = doc.select("h1, h2").firstOrNull()?.text()?.trim() ?: "Кубок г. Москвы"
                   val parsedTables = mutableListOf<ParsedTable>()
                   val extractedMatches = mutableListOf<HockeyMatch>()
                   val extractedPlayers = mutableListOf<List<String>>()
 
-                  // 1. Разбираем details.standings-group и внутренний [data-standings-content]
-                  val standingGroups = doc.select("details.standings-group")
+                  val standingGroups = doc.select(".standings-group")
                   for (gIdx in 0 until standingGroups.size) {
                       val groupEl = standingGroups[gIdx]
-                      val groupId = groupEl.attr("data-standings-group")
-                      val summarySpans = groupEl.select("summary span").map { it.text().trim() }.filter { it.isNotEmpty() }
-                      val groupTitle = summarySpans.getOrNull(0) ?: "Группа #${gIdx + 1}"
-                      val groupCount = summarySpans.getOrNull(1) ?: "ID: $groupId"
+                      val groupTitle = groupEl.select("summary").firstOrNull()?.text()?.trim()
+                          ?: "Группа #${gIdx + 1}"
 
-                      val contentEl = groupEl.selectFirst("[data-standings-content]")
                       val rows = mutableListOf<List<String>>()
-                      var headers = listOf("#", "Команда", "И", "В", "П", "Ш", "О")
-
-                      if (contentEl != null) {
-                          val ths = contentEl.select("th").map { it.text().trim() }.filter { it.isNotEmpty() }
-                          if (ths.isNotEmpty()) headers = ths
-
-                          val trs = contentEl.select("tr, [class*=row], [class*=item]")
-                          for (tr in trs) {
-                              val cells = tr.select("td, [class*=cell], [class*=col], span, a")
-                                  .filter { it.childrenSize() == 0 && it.text().trim().isNotEmpty() }
-                                  .map { it.text().trim() }
-                              if (cells.size >= 2) {
-                                  rows.add(cells)
-                              }
+                      val candidateRows = groupEl.select("tr, [class*=row], [class*=item], [class*=team]")
+                      for (rEl in candidateRows) {
+                          val childrenTexts = mutableListOf<String>()
+                          for (ch in rEl.children()) {
+                              val t = ch.text().trim()
+                              if (t.isNotEmpty()) childrenTexts.add(t)
                           }
-
-                          if (rows.isEmpty() && contentEl.text().trim().isNotEmpty()) {
-                              rows.add(listOf(contentEl.text().trim().take(200)))
+                          if (childrenTexts.size >= 3) {
+                              rows.add(childrenTexts)
                           }
                       }
 
                       if (rows.isEmpty()) {
-                          rows.add(listOf("Контейнер data-standings-content пуст (group=$groupId). Проверь вкладку Веб / DOM."))
+                          val leafEls = groupEl.select("span, div, a, td")
+                          val leafTexts = mutableListOf<String>()
+                          for (lEl in leafEls) {
+                              if (lEl.childrenSize() == 0) {
+                                  val t = lEl.text().trim()
+                                  if (t.isNotEmpty()) leafTexts.add(t)
+                              }
+                          }
+                          if (leafTexts.isNotEmpty()) {
+                              rows.add(leafTexts.take(20))
+                          }
                       }
 
                       parsedTables.add(
                           ParsedTable(
-                              title = "$groupTitle (ID $groupId)",
-                              subtitle = groupCount,
-                              headers = headers,
+                              title = groupTitle,
+                              headers = listOf("#", "Команда / Данные группы"),
                               rows = rows
                           )
                       )
                   }
 
-                  // 2. Разбираем карточки матчей внутри .match-wrapper / .people-scroll__page
-                  val matchPages = doc.select(".match-wrapper, .people-scroll__page")
-                  for (mp in matchPages) {
-                      val cards = mp.select("[class*=match], [class*=card], [class*=item], a[href*=match], tr")
-                      for (cEl in cards) {
-                          val fullText = cEl.text().trim()
-                          if (fullText.length in 12..220 && !fullText.contains("Показать записи") && !fullText.contains("Загрузить записи")) {
-                              val scoreMatch = SCORE_REGEX.find(fullText)
-                              val leafTexts = cEl.select("span, div, p, strong, b, a")
-                                  .filter { it.childrenSize() == 0 && it.text().trim().isNotEmpty() }
-                                  .map { it.text().trim() }
-                                  .distinct()
+                  val wrappers = doc.select(".tournament-wrapper")
+                  for (wIdx in 0 until wrappers.size) {
+                      val w = wrappers[wIdx]
+                      val allDivs = w.select("div, a, li, tr")
+                      for (el in allDivs) {
+                          val childTexts = mutableListOf<String>()
+                          for (ch in el.children()) {
+                              val t = ch.text().trim()
+                              if (t.isNotEmpty()) childTexts.add(t)
+                          }
+                          val fullText = el.text().trim()
 
-                              val teams = leafTexts.filter { it.length in 3..40 && !it.all { ch -> ch.isDigit() } }
-                              if (teams.size >= 2) {
-                                  val score = scoreMatch?.value ?: "МАТЧ"
-                                  val home = teams[0]
-                                  val away = teams[1]
-                                  if (extractedMatches.none { it.homeTeam == home && it.awayTeam == away && it.rawDetails == fullText }) {
+                          val scoreMatch = SCORE_REGEX.find(fullText)
+                          if (childTexts.size in 2..8 && fullText.length in 10..200) {
+                              val teamCandidates = childTexts.filter {
+                                  it.length in 3..40 && !it.all { c -> c.isDigit() } && !it.contains("матчи", true)
+                              }
+                              if (teamCandidates.size >= 2 && scoreMatch != null) {
+                                  val home = teamCandidates[0]
+                                  val away = teamCandidates[1]
+                                  if (extractedMatches.none { it.homeTeam == home && it.awayTeam == away && it.scoreText == scoreMatch.value }) {
                                       extractedMatches.add(
                                           HockeyMatch(
                                               id = "m_${extractedMatches.size}",
                                               homeTeam = home,
                                               awayTeam = away,
-                                              scoreText = score,
-                                              infoLine = leafTexts.firstOrNull() ?: h1,
-                                              status = if (scoreMatch != null) "СЧЕТ" else "КАЛЕНДАРЬ",
-                                              rawDetails = leafTexts.joinToString(" | ")
+                                              scoreText = scoreMatch.value,
+                                              infoLine = childTexts.firstOrNull() ?: h1,
+                                              status = "МАТЧ ФХМ",
+                                              rawDetails = childTexts.joinToString(" | ")
                                           )
                                       )
                                   }
                               }
                           }
-                      }
-                  }
 
-                  // 3. Разбираем лучших игроков в [data-render-module="best-players-block"]
-                  val bestBlock = doc.selectFirst("[data-render-module=best-players-block]")
-                  if (bestBlock != null) {
-                      val playerItems = bestBlock.select("tr, [class*=player], [class*=row], [class*=card], [class*=item]")
-                      for (pEl in playerItems) {
-                          val pTexts = pEl.select("td, span, div, a")
-                              .filter { it.childrenSize() == 0 && it.text().trim().isNotEmpty() }
-                              .map { it.text().trim() }
-                          if (pTexts.size >= 3 && !pTexts.joinToString(" ").contains("Сбросить")) {
-                              extractedPlayers.add(pTexts)
+                          val numericCount = childTexts.count { it.isNotEmpty() && it.all { c -> c.isDigit() } }
+                          if (childTexts.size >= 4 && numericCount >= 2) {
+                              extractedPlayers.add(childTexts)
                           }
                       }
                   }
 
-                  // 4. Формируем отчет с перехваченными сетевыми URL и содержимым контейнеров
                   val wrapperBuilder = StringBuilder()
-                  val wrappers = doc.select(".tournament-wrapper")
                   for (idx in 0 until wrappers.size) {
                       val el = wrappers[idx]
-                      wrapperBuilder.append("--- WRAPPER #").append(idx)
-                          .append(" (data-render-module=").append(el.attr("data-render-module")).append(") ---\n")
-                      wrapperBuilder.append(el.outerHtml().take(3000)).append("\n\n")
+                      wrapperBuilder.append("--- WRAPPER #").append(idx).append(" (class=").append(el.className()).append(") ---\n")
+                      wrapperBuilder.append(el.outerHtml().take(2500)).append("\n\n")
                   }
 
                   val report = buildString {
-                      appendLine("=== ОТЧЕТ ПАРСЕРА v2.4 (NETWORK INTERCEPTOR) ===")
-                      appendLine("URL: $url (Режим: $actionMode)")
+                      appendLine("=== ОТЧЕТ ПАРСЕРА v2.5 (JS BUNDLE + SUMMARY CLICK) ===")
+                      appendLine("URL: $url (Режим вкладки: $actionMode)")
                       appendLine("Турнир: $h1")
                       appendLine("Всего DOM-элементов: ${doc.allElements.size}")
                       appendLine("Найдено групп standings-group: ${standingGroups.size}")
                       appendLine("Найдено матчей: ${extractedMatches.size}")
-                      appendLine("Найдено игроков: ${extractedPlayers.size}")
-                      appendLine("\n=== ВСЕ СЕТЕВЫЕ ЗАПРОСЫ СТРАНИЦЫ (WebView Interceptor) ===")
-                      appendLine(if (networkUrls.isNotEmpty()) networkUrls else "Сетевые запросы не зафиксированы")
+                      appendLine("Найдено цифровых строк: ${extractedPlayers.size}")
+                      appendLine("\n=== ПЕРЕХВАЧЕННЫЕ XHR/FETCH ЗАПРОСЫ ===")
+                      appendLine(if (apiLogs.isNotEmpty()) apiLogs else "Пусто")
+                      appendLine("\n=== АНАЛИЗ JS-КОДА САЙТА (API ЭНДПОИНТЫ ФХМ) ===")
+                      appendLine(jsBundleReport)
                       appendLine("\n=== ИСХОДНЫЙ HTML ВНУТРИ .tournament-wrapper ===")
                       appendLine(wrapperBuilder.toString())
                   }
@@ -593,14 +563,14 @@ jobs:
                               secondary = KhlIceBlue
                           )
                       ) {
-                          FhmKhlAppV24()
+                          FhmKhlAppV25()
                       }
                   }
               }
           }
 
           @Composable
-          fun FhmKhlAppV24() {
+          fun FhmKhlAppV25() {
               val context = LocalContext.current
               val scope = rememberCoroutineScope()
 
@@ -645,7 +615,7 @@ jobs:
                                       Box(modifier = Modifier.size(9.dp).clip(CircleShape).background(KhlAccentRed))
                                       Spacer(modifier = Modifier.width(8.dp))
                                       Text(
-                                          text = "ФХМ v2.4 • ТУРНИР #$tournamentId",
+                                          text = "ФХМ v2.5 • ТУРНИР #$tournamentId",
                                           color = KhlIceBlue,
                                           fontSize = 12.sp,
                                           fontWeight = FontWeight.Bold
@@ -673,8 +643,8 @@ jobs:
                               horizontalArrangement = Arrangement.spacedBy(8.dp)
                           ) {
                               val modes = listOf(
-                                  0 to "Матчи (209 / 67)",
-                                  1 to "Таблица (Группы А, Б, В)",
+                                  0 to "Прошедшие матчи",
+                                  1 to "Таблица (3 группы)",
                                   2 to "Лучшие игроки"
                               )
                               modes.forEach { pair ->
@@ -720,7 +690,7 @@ jobs:
                               selected = bottomTab == 2,
                               onClick = { bottomTab = 2 },
                               icon = { Icon(Icons.Default.EmojiEvents, null) },
-                              label = { Text("Игроки (${pageData?.playerRows?.size ?: 0})") }
+                              label = { Text("Строки (${pageData?.playerRows?.size ?: 0})") }
                           )
                           NavigationBarItem(
                               selected = bottomTab == 3,
@@ -744,7 +714,7 @@ jobs:
                               CircularProgressIndicator(color = KhlAccentRed)
                               Spacer(modifier = Modifier.height(12.dp))
                               Text(
-                                  text = "Ожидание ответа модулей ФХМ (Группа А=318, Б=321, В=324)...",
+                                  text = "Раскрываем группы и сканируем API модулей ФХМ...",
                                   color = KhlTextGray,
                                   fontSize = 12.sp,
                                   textAlign = TextAlign.Center,
@@ -792,7 +762,7 @@ jobs:
               if (data.matches.isEmpty()) {
                   Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
                       Text(
-                          text = "Нажми сверху кнопку «Матчи (209 / 67)», чтобы загрузить карточки матчей, либо проверь вкладку «Веб / DOM».",
+                          text = "Нажми сверху кнопку «Прошедшие матчи», либо открой вкладку «Веб / DOM» и нажми «Скопировать DOM».",
                           color = KhlTextGray,
                           fontSize = 14.sp,
                           textAlign = TextAlign.Center
@@ -857,30 +827,18 @@ jobs:
                           shape = RoundedCornerShape(12.dp),
                           modifier = Modifier.fillMaxWidth()
                       ) {
-                          Column(modifier = Modifier.padding(14.dp)) {
-                              Row(
-                                  modifier = Modifier.fillMaxWidth(),
-                                  horizontalArrangement = Arrangement.SpaceBetween,
-                                  verticalAlignment = Alignment.CenterVertically
-                              ) {
-                                  Text(
-                                      text = table.title,
-                                      color = KhlIceBlue,
-                                      fontSize = 15.sp,
-                                      fontWeight = FontWeight.Black
-                                  )
-                                  Text(
-                                      text = table.subtitle,
-                                      color = KhlAccentRed,
-                                      fontSize = 12.sp,
-                                      fontWeight = FontWeight.Bold
-                                  )
-                              }
-                              Spacer(modifier = Modifier.height(8.dp))
+                          Column(modifier = Modifier.padding(12.dp)) {
+                              Text(
+                                  text = table.title,
+                                  color = KhlIceBlue,
+                                  fontSize = 14.sp,
+                                  fontWeight = FontWeight.Black,
+                                  modifier = Modifier.padding(bottom = 8.dp)
+                              )
                               for (rIdx in 0 until table.rows.size) {
                                   val row = table.rows[rIdx]
                                   Text(
-                                      text = row.joinToString("  •  "),
+                                      text = row.joinToString("  |  "),
                                       color = Color.White,
                                       fontSize = 12.sp,
                                       modifier = Modifier.padding(vertical = 4.dp)
@@ -897,7 +855,7 @@ jobs:
               if (data.playerRows.isEmpty()) {
                   Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
                       Text(
-                          text = "Нажми сверху «Лучшие игроки», чтобы подгрузить статистику по группам 318 / 321 / 324.",
+                          text = "Строки еще не загружены. Переключи режим сверху или проверь «Веб / DOM».",
                           color = KhlTextGray,
                           fontSize = 14.sp,
                           textAlign = TextAlign.Center
@@ -1016,16 +974,16 @@ jobs:
           gradle assembleDebug --no-daemon 2>&1 | tee build_output.log || {
             echo "### Ошибки компиляции Kotlin" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-            grep -E "e: |FAILURE|What went wrong" -A 5 build_output.log || tail -n 40 build_output.log >> $GITHUB_STEP_SUMMARY
+            { grep -E "e: |FAILURE|What went wrong" -A 8 build_output.log || tail -n 40 build_output.log; } >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
             exit 1
           }
 
-      - name: Rename APK to v2.4
-        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/fhm-tournament54-v24.apk
+      - name: Rename APK to v2.5
+        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/fhm-tournament54-v25.apk
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fhm-tournament54-v24
-          path: app/build/outputs/apk/debug/fhm-tournament54-v24.apk
+          name: fhm-tournament54-v25
+          path: app/build/outputs/apk/debug/fhm-tournament54-v25.apk
