@@ -1,4 +1,4 @@
-name: Build FHM v2.2 APK
+name: Build FHM v2.3 APK
 
 on:
   push:
@@ -25,7 +25,7 @@ jobs:
           unzip -q gradle-8.7-bin.zip -d /tmp
           echo "/tmp/gradle-8.7/bin" >> $GITHUB_PATH
 
-      - name: Generate v2.2 project
+      - name: Generate v2.3 project
         run: |
           rm -rf app settings.gradle.kts build.gradle.kts gradle.properties
           mkdir -p app/src/main/java/com/fhm/khlstyle
@@ -45,7 +45,7 @@ jobs:
                   mavenCentral()
               }
           }
-          rootProject.name = "FHM_KHL_V22"
+          rootProject.name = "FHM_KHL_V23"
           include(":app")
           EOF
 
@@ -77,8 +77,8 @@ jobs:
                   applicationId = "com.fhm.khlstyle"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 22
-                  versionName = "2.2"
+                  versionCode = 23
+                  versionName = "2.3"
               }
 
               buildTypes {
@@ -121,7 +121,7 @@ jobs:
               <application
                   android:allowBackup="false"
                   android:icon="@android:drawable/sym_def_app_icon"
-                  android:label="ФХМ 54 (v2.2)"
+                  android:label="ФХМ 54 (v2.3)"
                   android:supportsRtl="true"
                   android:usesCleartextTraffic="true"
                   android:theme="@android:style/Theme.Material.NoActionBar">
@@ -188,10 +188,10 @@ jobs:
           import kotlinx.coroutines.suspendCancellableCoroutine
           import kotlinx.coroutines.withContext
           import kotlinx.coroutines.withTimeoutOrNull
+          import org.json.JSONObject
           import org.json.JSONTokener
           import org.jsoup.Jsoup
           import org.jsoup.nodes.Document
-          import org.jsoup.nodes.Element
           import kotlin.coroutines.resume
 
           data class HockeyMatch(
@@ -225,7 +225,7 @@ jobs:
               suspend fun loadTournament(
                   context: Context,
                   tournamentId: String,
-                  actionMode: Int // 0 = Прошедшие матчи, 1 = Таблица (раскрыть группы), 2 = Лучшие игроки
+                  actionMode: Int
               ): TournamentPageData {
                   val tabParam = when (actionMode) {
                       0 -> 0
@@ -234,7 +234,9 @@ jobs:
                   }
                   val targetUrl = "https://fhmoscow.com/tournament/$tournamentId?tournament-tab=$tabParam"
 
-                  val (renderedHtml, apiLogs) = fetchInteractiveDomViaWebView(context, targetUrl, actionMode)
+                  val pairResult = fetchInteractiveDomViaWebView(context, targetUrl, actionMode)
+                  val renderedHtml = pairResult.first
+                  val apiLogs = pairResult.second
 
                   if (renderedHtml.isEmpty()) {
                       return TournamentPageData(
@@ -258,7 +260,7 @@ jobs:
                   actionMode: Int
               ): Pair<String, String> {
                   return withContext(Dispatchers.Main) {
-                      val result: Pair<String, String>? = withTimeoutOrNull<Pair<String, String>>(20000L) {
+                      val result: Pair<String, String>? = withTimeoutOrNull<Pair<String, String>>(22000L) {
                           suspendCancellableCoroutine<Pair<String, String>> { cont ->
                               val webView = WebView(context)
                               webView.settings.javaScriptEnabled = true
@@ -269,96 +271,71 @@ jobs:
                               var finished = false
                               val mainHandler = Handler(Looper.getMainLooper())
 
+                              val hooksJs = "(function() {" +
+                                  "window.__fhmApiCalls = window.__fhmApiCalls || [];" +
+                                  "if (!window.__fhmHooked) {" +
+                                  "  window.__fhmHooked = true;" +
+                                  "  var origFetch = window.fetch;" +
+                                  "  if (origFetch) {" +
+                                  "    window.fetch = function() {" +
+                                  "      var u = arguments[0];" +
+                                  "      return origFetch.apply(this, arguments).then(function(resp) {" +
+                                  "        try { resp.clone().text().then(function(txt) { window.__fhmApiCalls.push('FETCH: ' + u + ' -> ' + txt.substring(0, 350)); }); } catch(e) {}" +
+                                  "        return resp;" +
+                                  "      });" +
+                                  "    };" +
+                                  "  }" +
+                                  "  var origOpen = XMLHttpRequest.prototype.open;" +
+                                  "  XMLHttpRequest.prototype.open = function(m, u) { this._url = u; return origOpen.apply(this, arguments); };" +
+                                  "  var origSend = XMLHttpRequest.prototype.send;" +
+                                  "  XMLHttpRequest.prototype.send = function() {" +
+                                  "    var self = this;" +
+                                  "    this.addEventListener('load', function() {" +
+                                  "      try { window.__fhmApiCalls.push('XHR: ' + self._url + ' -> ' + (self.responseText || '').substring(0, 350)); } catch(e) {}" +
+                                  "    });" +
+                                  "    return origSend.apply(this, arguments);" +
+                                  "  };" +
+                                  "}" +
+                                  "})();"
+
+                              val clickJs = "(function() {" +
+                                  "var mode = " + actionMode + ";" +
+                                  "var tTabs = document.querySelectorAll('.tournament-tab');" +
+                                  "if (tTabs.length > mode) { tTabs[mode].click(); }" +
+                                  "if (mode === 0) {" +
+                                  "  var mTabs = document.querySelectorAll('.match-tab');" +
+                                  "  if (mTabs.length > 1) { mTabs[1].click(); }" +
+                                  "}" +
+                                  "var groups = document.querySelectorAll('.standings-group, .standings-group__header, [class*=standings-group]');" +
+                                  "for (var i = 0; i < groups.length; i++) { try { groups[i].click(); } catch(e) {} }" +
+                                  "})();"
+
+                              val dumpJs = "(function() {" +
+                                  "var logs = (window.__fhmApiCalls || []).join('\\n===\\n');" +
+                                  "return JSON.stringify({ html: document.documentElement.outerHTML, logs: logs });" +
+                                  "})();"
+
                               webView.webViewClient = object : WebViewClient() {
                                   override fun onPageFinished(view: WebView?, loadedUrl: String?) {
                                       if (finished) return
-
-                                      // Внедряем перехватчик fetch/XHR и скрипт авто-раскрытия вкладок ФХМ
-                                      val hooksJs = """
-                                          (function() {
-                                              window.__fhmApiCalls = window.__fhmApiCalls || [];
-                                              if (!window.__fhmHooked) {
-                                                  window.__fhmHooked = true;
-                                                  var origFetch = window.fetch;
-                                                  if (origFetch) {
-                                                      window.fetch = function() {
-                                                          var u = arguments[0];
-                                                          return origFetch.apply(this, arguments).then(function(resp) {
-                                                              try {
-                                                                  resp.clone().text().then(function(txt) {
-                                                                      window.__fhmApiCalls.push("FETCH: " + u + " -> " + txt.substring(0, 350));
-                                                                  });
-                                                              } catch(e) {}
-                                                              return resp;
-                                                          });
-                                                      };
-                                                  }
-                                                  var origOpen = XMLHttpRequest.prototype.open;
-                                                  XMLHttpRequest.prototype.open = function(method, url) {
-                                                      this._url = url;
-                                                      return origOpen.apply(this, arguments);
-                                                  };
-                                                  var origSend = XMLHttpRequest.prototype.send;
-                                                  XMLHttpRequest.prototype.send = function() {
-                                                      var self = this;
-                                                      this.addEventListener('load', function() {
-                                                          try {
-                                                              window.__fhmApiCalls.push("XHR: " + self._url + " -> " + (self.responseText || "").substring(0, 350));
-                                                          } catch(e) {}
-                                                      });
-                                                      return origSend.apply(this, arguments);
-                                                  };
-                                              }
-                                          })();
-                                      """.trimIndent()
                                       webView.evaluateJavascript(hooksJs, null)
 
-                                      // Через 1.5 сек после загрузки кликаем по нужной вкладке и раскрываем группы
                                       mainHandler.postDelayed({
-                                          val clickJs = """
-                                              (function() {
-                                                  var mode = $actionMode;
-                                                  var tTabs = document.querySelectorAll('.tournament-tab');
-                                                  if (tTabs.length > mode) {
-                                                      tTabs[mode].click();
-                                                  }
-                                                  if (mode === 0) {
-                                                      // Нажимаем "Прошедшие матчи", если в ближайших пусто
-                                                      var mTabs = document.querySelectorAll('.match-tab');
-                                                      if (mTabs.length > 1) {
-                                                          mTabs[1].click();
-                                                      }
-                                                  }
-                                                  // Кликаем по всем заголовкам групп standings-group, чтобы они раскрылись
-                                                  var groups = document.querySelectorAll('.standings-group, .standings-group__header, [class*=standings-group]');
-                                                  for (var i = 0; i < groups.length; i++) {
-                                                      try { groups[i].click(); } catch(e) {}
-                                                  }
-                                              })();
-                                          """.trimIndent()
-                                          webView.evaluateJavascript(clickJs, null)
+                                          if (!finished && cont.isActive) {
+                                              webView.evaluateJavascript(clickJs, null)
+                                          }
                                       }, 1500L)
 
-                                      // Еще через 3 сек снимаем готовый HTML и список перехваченных JSON-запросов
                                       mainHandler.postDelayed({
                                           if (!finished && cont.isActive) {
                                               finished = true
-                                              val dumpJs = """
-                                                  (function() {
-                                                      var logs = (window.__fhmApiCalls || []).join("\n===\n");
-                                                      return JSON.stringify({
-                                                          html: document.documentElement.outerHTML,
-                                                          logs: logs
-                                                      });
-                                                  })();
-                                              """.trimIndent()
                                               webView.evaluateJavascript(dumpJs) { rawJson ->
                                                   var htmlOut = ""
                                                   var logsOut = ""
                                                   try {
                                                       if (rawJson != null) {
                                                           val unquoted = JSONTokener(rawJson).nextValue()?.toString() ?: ""
-                                                          val obj = org.json.JSONObject(unquoted)
+                                                          val obj = JSONObject(unquoted)
                                                           htmlOut = obj.optString("html", "")
                                                           logsOut = obj.optString("logs", "")
                                                       }
@@ -399,7 +376,6 @@ jobs:
                   val extractedMatches = mutableListOf<HockeyMatch>()
                   val extractedPlayers = mutableListOf<List<String>>()
 
-                  // 1. Разбираем группы турнирной таблицы (.standings-group и дочерние строки)
                   val standingGroups = doc.select(".standings-group")
                   for (gIdx in 0 until standingGroups.size) {
                       val groupEl = standingGroups[gIdx]
@@ -407,22 +383,29 @@ jobs:
                           ?: "Группа #${gIdx + 1}"
 
                       val rows = mutableListOf<List<String>>()
-                      // Ищем строки внутри группы (table tr или блочные div-строки)
                       val candidateRows = groupEl.select("tr, [class*=row], [class*=item], [class*=team]")
                       for (rEl in candidateRows) {
-                          val childrenTexts = rEl.children().map { it.text().trim() }.filter { it.isNotEmpty() }
+                          val childrenTexts = mutableListOf<String>()
+                          for (ch in rEl.children()) {
+                              val t = ch.text().trim()
+                              if (t.isNotEmpty()) childrenTexts.add(t)
+                          }
                           if (childrenTexts.size >= 3) {
                               rows.add(childrenTexts)
                           }
                       }
 
                       if (rows.isEmpty()) {
-                          // Если строки лежат глубже или одним списком, разбиваем по структуре текста
-                          val allLeafTexts = groupEl.select("span, div, a, td")
-                              .filter { it.childrenSize() == 0 && it.text().trim().isNotEmpty() }
-                              .map { it.text().trim() }
-                          if (allLeafTexts.isNotEmpty()) {
-                              rows.add(allLeafTexts.take(12))
+                          val leafEls = groupEl.select("span, div, a, td")
+                          val leafTexts = mutableListOf<String>()
+                          for (lEl in leafEls) {
+                              if (lEl.childrenSize() == 0) {
+                                  val t = lEl.text().trim()
+                                  if (t.isNotEmpty()) leafTexts.add(t)
+                              }
+                          }
+                          if (leafTexts.isNotEmpty()) {
+                              rows.add(leafTexts.take(15))
                           }
                       }
 
@@ -435,19 +418,23 @@ jobs:
                       )
                   }
 
-                  // 2. Ищем любые flex/grid строки во всем .tournament-wrapper
                   val wrappers = doc.select(".tournament-wrapper")
                   for (wIdx in 0 until wrappers.size) {
                       val w = wrappers[wIdx]
                       val allDivs = w.select("div, a, li")
                       for (el in allDivs) {
-                          val childTexts = el.children().map { it.text().trim() }.filter { it.isNotEmpty() }
+                          val childTexts = mutableListOf<String>()
+                          for (ch in el.children()) {
+                              val t = ch.text().trim()
+                              if (t.isNotEmpty()) childTexts.add(t)
+                          }
                           val fullText = el.text().trim()
 
-                          // Проверка на карточку матча
                           val scoreMatch = SCORE_REGEX.find(fullText)
                           if (childTexts.size in 2..8 && fullText.length in 10..200) {
-                              val teamCandidates = childTexts.filter { it.length in 3..40 && !it.all { c -> c.isDigit() } && !it.contains("матчи", true) }
+                              val teamCandidates = childTexts.filter {
+                                  it.length in 3..40 && !it.all { c -> c.isDigit() } && !it.contains("матчи", true)
+                              }
                               if (teamCandidates.size >= 2 && scoreMatch != null) {
                                   val home = teamCandidates[0]
                                   val away = teamCandidates[1]
@@ -467,27 +454,31 @@ jobs:
                               }
                           }
 
-                          // Если это строка таблицы или игрока (много колонок с цифрами)
-                          val numericCount = childTexts.count { it.all { c -> c.isDigit() } && it.isNotEmpty() }
+                          val numericCount = childTexts.count { it.isNotEmpty() && it.all { c -> c.isDigit() } }
                           if (childTexts.size >= 4 && numericCount >= 2) {
                               extractedPlayers.add(childTexts)
                           }
                       }
                   }
 
-                  // 3. Детальный слепок ВНУТРЕННОСТЕЙ .tournament-wrapper и .standings-group для точной настройки
-                  val wrapperHtmlDump = wrappers.mapIndexed { idx, el ->
-                      "--- WRAPPER #$idx (class=${el.className()}) ---\n" +
-                          el.outerHtml().take(2500)
-                  }.joinToString("\n\n")
+                  val wrapperBuilder = StringBuilder()
+                  for (idx in 0 until wrappers.size) {
+                      val el = wrappers[idx]
+                      wrapperBuilder.append("--- WRAPPER #").append(idx).append(" (class=").append(el.className()).append(") ---\n")
+                      wrapperBuilder.append(el.outerHtml().take(2800)).append("\n\n")
+                  }
 
-                  val scriptsDump = doc.select("script")
-                      .map { it.attr("src") + " | " + it.data().take(200) }
-                      .filter { it.length > 5 }
-                      .joinToString("\n")
+                  val scriptsBuilder = StringBuilder()
+                  val scriptEls = doc.select("script")
+                  for (sEl in scriptEls) {
+                      val line = sEl.attr("src") + " | " + sEl.data().take(200)
+                      if (line.length > 5) {
+                          scriptsBuilder.append(line).append("\n")
+                      }
+                  }
 
                   val report = buildString {
-                      appendLine("=== ОТЧЕТ ПАРСЕРА v2.2 (SPA + AUTO-CLICK) ===")
+                      appendLine("=== ОТЧЕТ ПАРСЕРА v2.3 (SPA + AUTO-CLICK) ===")
                       appendLine("URL: $url (Режим вкладки: $actionMode)")
                       appendLine("Турнир: $h1")
                       appendLine("Всего DOM-элементов после клика: ${doc.allElements.size}")
@@ -497,9 +488,9 @@ jobs:
                       appendLine("\n=== ПЕРЕХВАЧЕННЫЕ XHR/FETCH ЗАПРОСЫ ===")
                       appendLine(if (apiLogs.isNotEmpty()) apiLogs else "Запросы прошли до инициализации перехватчика")
                       appendLine("\n=== СКРИПТЫ СТРАНИЦЫ ===")
-                      appendLine(scriptsDump.take(1200))
+                      appendLine(scriptsBuilder.toString().take(1200))
                       appendLine("\n=== ИСХОДНЫЙ HTML ВНУТРИ .tournament-wrapper ===")
-                      appendLine(wrapperHtmlDump)
+                      appendLine(wrapperBuilder.toString())
                   }
 
                   return TournamentPageData(
@@ -520,7 +511,7 @@ jobs:
           val KhlTextGray = Color(0xFF8F9BB3)
 
           class MainActivity : ComponentActivity() {
-              override fun onCreate(savedInstanceState) {
+              override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   setContent {
                       MaterialTheme(
@@ -531,20 +522,20 @@ jobs:
                               secondary = KhlIceBlue
                           )
                       ) {
-                          FhmKhlAppV22()
+                          FhmKhlAppV23()
                       }
                   }
               }
           }
 
           @Composable
-          fun FhmKhlAppV22() {
+          fun FhmKhlAppV23() {
               val context = LocalContext.current
               val scope = rememberCoroutineScope()
 
               var bottomTab by remember { mutableIntStateOf(1) }
               var tournamentId by remember { mutableStateOf("54") }
-              var actionMode by remember { mutableIntStateOf(1) } // 0=Матчи, 1=Таблица, 2=Игроки
+              var actionMode by remember { mutableIntStateOf(1) }
 
               var pageData by remember { mutableStateOf<TournamentPageData?>(null) }
               var isLoading by remember { mutableStateOf(true) }
@@ -583,7 +574,7 @@ jobs:
                                       Box(modifier = Modifier.size(9.dp).clip(CircleShape).background(KhlAccentRed))
                                       Spacer(modifier = Modifier.width(8.dp))
                                       Text(
-                                          text = "ФХМ v2.2 • ТУРНИР #$tournamentId",
+                                          text = "ФХМ v2.3 • ТУРНИР #$tournamentId",
                                           color = KhlIceBlue,
                                           fontSize = 12.sp,
                                           fontWeight = FontWeight.Bold
@@ -730,7 +721,7 @@ jobs:
               if (data.matches.isEmpty()) {
                   Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
                       Text(
-                          text = "Нажми сверху кнопку «Прошедшие матчи», либо открой вкладку «Веб / DOM» и скопируй HTML-код блока .tournament-wrapper.",
+                          text = "Нажми сверху кнопку «Прошедшие матчи», либо открой вкладку «Веб / DOM» и нажми «Скопировать DOM».",
                           color = KhlTextGray,
                           fontSize = 14.sp,
                           textAlign = TextAlign.Center
@@ -939,19 +930,19 @@ jobs:
       - name: Build Debug APK
         run: |
           set -o pipefail
-          gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee build_output.log || {
-            echo "### Ошибка сборки Gradle" >> $GITHUB_STEP_SUMMARY
+          gradle assembleDebug --no-daemon 2>&1 | tee build_output.log || {
+            echo "### Ошибки компиляции Kotlin" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-            tail -n 60 build_output.log >> $GITHUB_STEP_SUMMARY
+            grep -E "e: |FAILURE|What went wrong" -A 5 build_output.log || tail -n 40 build_output.log >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
             exit 1
           }
 
-      - name: Rename APK to v2.2
-        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/fhm-tournament54-v22.apk
+      - name: Rename APK to v2.3
+        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/fhm-tournament54-v23.apk
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fhm-tournament54-v22
-          path: app/build/outputs/apk/debug/fhm-tournament54-v22.apk
+          name: fhm-tournament54-v23
+          path: app/build/outputs/apk/debug/fhm-tournament54-v23.apk
