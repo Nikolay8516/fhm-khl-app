@@ -1,4 +1,4 @@
-name: Build FHM v2 APK
+name: Build FHM v2.2 APK
 
 on:
   push:
@@ -25,7 +25,7 @@ jobs:
           unzip -q gradle-8.7-bin.zip -d /tmp
           echo "/tmp/gradle-8.7/bin" >> $GITHUB_PATH
 
-      - name: Clean old v1 files and generate v2 project
+      - name: Generate v2.2 project
         run: |
           rm -rf app settings.gradle.kts build.gradle.kts gradle.properties
           mkdir -p app/src/main/java/com/fhm/khlstyle
@@ -45,7 +45,7 @@ jobs:
                   mavenCentral()
               }
           }
-          rootProject.name = "FHM_KHL_V2"
+          rootProject.name = "FHM_KHL_V22"
           include(":app")
           EOF
 
@@ -77,8 +77,8 @@ jobs:
                   applicationId = "com.fhm.khlstyle"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 21
-                  versionName = "2.1"
+                  versionCode = 22
+                  versionName = "2.2"
               }
 
               buildTypes {
@@ -121,7 +121,7 @@ jobs:
               <application
                   android:allowBackup="false"
                   android:icon="@android:drawable/sym_def_app_icon"
-                  android:label="ФХМ 54 (v2.1)"
+                  android:label="ФХМ 54 (v2.2)"
                   android:supportsRtl="true"
                   android:usesCleartextTraffic="true"
                   android:theme="@android:style/Theme.Material.NoActionBar">
@@ -191,6 +191,7 @@ jobs:
           import org.json.JSONTokener
           import org.jsoup.Jsoup
           import org.jsoup.nodes.Document
+          import org.jsoup.nodes.Element
           import kotlin.coroutines.resume
 
           data class HockeyMatch(
@@ -224,51 +225,41 @@ jobs:
               suspend fun loadTournament(
                   context: Context,
                   tournamentId: String,
-                  tabIndex: Int
+                  actionMode: Int // 0 = Прошедшие матчи, 1 = Таблица (раскрыть группы), 2 = Лучшие игроки
               ): TournamentPageData {
-                  val targetUrl = "https://fhmoscow.com/tournament/$tournamentId?tournament-tab=$tabIndex"
-
-                  var doc: Document? = withContext(Dispatchers.IO) {
-                      try {
-                          Jsoup.connect(targetUrl)
-                              .userAgent("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
-                              .timeout(8000)
-                              .get()
-                      } catch (e: Exception) {
-                          null
-                      }
+                  val tabParam = when (actionMode) {
+                      0 -> 0
+                      1 -> 1
+                      else -> 2
                   }
+                  val targetUrl = "https://fhmoscow.com/tournament/$tournamentId?tournament-tab=$tabParam"
 
-                  val jsoupTablesCount = doc?.select("table tr")?.size ?: 0
-                  var usedWebView = false
+                  val (renderedHtml, apiLogs) = fetchInteractiveDomViaWebView(context, targetUrl, actionMode)
 
-                  if (doc == null || jsoupTablesCount < 2) {
-                      val renderedHtml = fetchRenderedHtmlViaWebView(context, targetUrl)
-                      if (renderedHtml.isNotEmpty()) {
-                          doc = Jsoup.parse(renderedHtml, targetUrl)
-                          usedWebView = true
-                      }
-                  }
-
-                  if (doc == null) {
+                  if (renderedHtml.isEmpty()) {
                       return TournamentPageData(
                           url = targetUrl,
-                          tournamentTitle = "Ошибка соединения с fhmoscow.com",
+                          tournamentTitle = "Ошибка загрузки fhmoscow.com",
                           matches = emptyList(),
                           tables = emptyList(),
                           playerRows = emptyList(),
-                          diagnosticReport = "Не удалось загрузить страницу $targetUrl."
+                          diagnosticReport = "Не удалось получить DOM страницы $targetUrl"
                       )
                   }
 
-                  return parseDomDocument(doc, targetUrl, usedWebView)
+                  val doc = Jsoup.parse(renderedHtml, targetUrl)
+                  return parseFhmSpaDocument(doc, targetUrl, actionMode, apiLogs)
               }
 
               @SuppressLint("SetJavaScriptEnabled")
-              private suspend fun fetchRenderedHtmlViaWebView(context: Context, url: String): String {
+              private suspend fun fetchInteractiveDomViaWebView(
+                  context: Context,
+                  url: String,
+                  actionMode: Int
+              ): Pair<String, String> {
                   return withContext(Dispatchers.Main) {
-                      val result: String? = withTimeoutOrNull<String>(15000L) {
-                          suspendCancellableCoroutine<String> { cont ->
+                      val result: Pair<String, String>? = withTimeoutOrNull<Pair<String, String>>(20000L) {
+                          suspendCancellableCoroutine<Pair<String, String>> { cont ->
                               val webView = WebView(context)
                               webView.settings.javaScriptEnabled = true
                               webView.settings.domStorageEnabled = true
@@ -281,24 +272,106 @@ jobs:
                               webView.webViewClient = object : WebViewClient() {
                                   override fun onPageFinished(view: WebView?, loadedUrl: String?) {
                                       if (finished) return
+
+                                      // Внедряем перехватчик fetch/XHR и скрипт авто-раскрытия вкладок ФХМ
+                                      val hooksJs = """
+                                          (function() {
+                                              window.__fhmApiCalls = window.__fhmApiCalls || [];
+                                              if (!window.__fhmHooked) {
+                                                  window.__fhmHooked = true;
+                                                  var origFetch = window.fetch;
+                                                  if (origFetch) {
+                                                      window.fetch = function() {
+                                                          var u = arguments[0];
+                                                          return origFetch.apply(this, arguments).then(function(resp) {
+                                                              try {
+                                                                  resp.clone().text().then(function(txt) {
+                                                                      window.__fhmApiCalls.push("FETCH: " + u + " -> " + txt.substring(0, 350));
+                                                                  });
+                                                              } catch(e) {}
+                                                              return resp;
+                                                          });
+                                                      };
+                                                  }
+                                                  var origOpen = XMLHttpRequest.prototype.open;
+                                                  XMLHttpRequest.prototype.open = function(method, url) {
+                                                      this._url = url;
+                                                      return origOpen.apply(this, arguments);
+                                                  };
+                                                  var origSend = XMLHttpRequest.prototype.send;
+                                                  XMLHttpRequest.prototype.send = function() {
+                                                      var self = this;
+                                                      this.addEventListener('load', function() {
+                                                          try {
+                                                              window.__fhmApiCalls.push("XHR: " + self._url + " -> " + (self.responseText || "").substring(0, 350));
+                                                          } catch(e) {}
+                                                      });
+                                                      return origSend.apply(this, arguments);
+                                                  };
+                                              }
+                                          })();
+                                      """.trimIndent()
+                                      webView.evaluateJavascript(hooksJs, null)
+
+                                      // Через 1.5 сек после загрузки кликаем по нужной вкладке и раскрываем группы
+                                      mainHandler.postDelayed({
+                                          val clickJs = """
+                                              (function() {
+                                                  var mode = $actionMode;
+                                                  var tTabs = document.querySelectorAll('.tournament-tab');
+                                                  if (tTabs.length > mode) {
+                                                      tTabs[mode].click();
+                                                  }
+                                                  if (mode === 0) {
+                                                      // Нажимаем "Прошедшие матчи", если в ближайших пусто
+                                                      var mTabs = document.querySelectorAll('.match-tab');
+                                                      if (mTabs.length > 1) {
+                                                          mTabs[1].click();
+                                                      }
+                                                  }
+                                                  // Кликаем по всем заголовкам групп standings-group, чтобы они раскрылись
+                                                  var groups = document.querySelectorAll('.standings-group, .standings-group__header, [class*=standings-group]');
+                                                  for (var i = 0; i < groups.length; i++) {
+                                                      try { groups[i].click(); } catch(e) {}
+                                                  }
+                                              })();
+                                          """.trimIndent()
+                                          webView.evaluateJavascript(clickJs, null)
+                                      }, 1500L)
+
+                                      // Еще через 3 сек снимаем готовый HTML и список перехваченных JSON-запросов
                                       mainHandler.postDelayed({
                                           if (!finished && cont.isActive) {
                                               finished = true
-                                              webView.evaluateJavascript(
-                                                  "(function() { return document.documentElement.outerHTML; })();"
-                                              ) { rawJson ->
-                                                  val html = try {
-                                                      if (rawJson != null) JSONTokener(rawJson).nextValue()?.toString() ?: "" else ""
+                                              val dumpJs = """
+                                                  (function() {
+                                                      var logs = (window.__fhmApiCalls || []).join("\n===\n");
+                                                      return JSON.stringify({
+                                                          html: document.documentElement.outerHTML,
+                                                          logs: logs
+                                                      });
+                                                  })();
+                                              """.trimIndent()
+                                              webView.evaluateJavascript(dumpJs) { rawJson ->
+                                                  var htmlOut = ""
+                                                  var logsOut = ""
+                                                  try {
+                                                      if (rawJson != null) {
+                                                          val unquoted = JSONTokener(rawJson).nextValue()?.toString() ?: ""
+                                                          val obj = org.json.JSONObject(unquoted)
+                                                          htmlOut = obj.optString("html", "")
+                                                          logsOut = obj.optString("logs", "")
+                                                      }
                                                   } catch (e: Exception) {
-                                                      ""
+                                                      htmlOut = ""
                                                   }
                                                   webView.destroy()
                                                   if (cont.isActive) {
-                                                      cont.resume(html)
+                                                      cont.resume(Pair(htmlOut, logsOut))
                                                   }
                                               }
                                           }
-                                      }, 3000L)
+                                      }, 4600L)
                                   }
                               }
 
@@ -311,178 +384,127 @@ jobs:
                               webView.loadUrl(url)
                           }
                       }
-                      result ?: ""
+                      result ?: Pair("", "")
                   }
               }
 
-              private fun parseDomDocument(
+              private fun parseFhmSpaDocument(
                   doc: Document,
                   url: String,
-                  usedWebView: Boolean
+                  actionMode: Int,
+                  apiLogs: String
               ): TournamentPageData {
-                  val h1El = doc.select("h1, h2, .tournament-title, .page-title, .title").firstOrNull()
-                  val h1 = h1El?.text()?.trim() ?: ""
-                  val docTitle = doc.title().trim()
-                  val tournamentTitle = if (h1.isNotEmpty()) h1 else if (docTitle.isNotEmpty()) docTitle else "Турнир ФХМ #54"
-
+                  val h1 = doc.select("h1, h2").firstOrNull()?.text()?.trim() ?: "Кубок г. Москвы"
                   val parsedTables = mutableListOf<ParsedTable>()
                   val extractedMatches = mutableListOf<HockeyMatch>()
                   val extractedPlayers = mutableListOf<List<String>>()
 
-                  val tables = doc.select("table")
-                  for (idx in 0 until tables.size) {
-                      val table = tables[idx]
-                      val headerEls = table.select("thead th, thead td, tr:first-child th")
-                      val headers = mutableListOf<String>()
-                      for (hEl in headerEls) {
-                          val t = hEl.text().trim()
-                          if (t.isNotEmpty()) headers.add(t)
+                  // 1. Разбираем группы турнирной таблицы (.standings-group и дочерние строки)
+                  val standingGroups = doc.select(".standings-group")
+                  for (gIdx in 0 until standingGroups.size) {
+                      val groupEl = standingGroups[gIdx]
+                      val groupTitle = groupEl.select("[class*=title], [class*=name], [class*=header]").firstOrNull()?.text()?.trim()
+                          ?: "Группа #${gIdx + 1}"
+
+                      val rows = mutableListOf<List<String>>()
+                      // Ищем строки внутри группы (table tr или блочные div-строки)
+                      val candidateRows = groupEl.select("tr, [class*=row], [class*=item], [class*=team]")
+                      for (rEl in candidateRows) {
+                          val childrenTexts = rEl.children().map { it.text().trim() }.filter { it.isNotEmpty() }
+                          if (childrenTexts.size >= 3) {
+                              rows.add(childrenTexts)
+                          }
                       }
 
-                      val bodyRows = mutableListOf<List<String>>()
-                      val tbodyTrs = table.select("tbody tr")
-                      val trs = if (tbodyTrs.isNotEmpty()) tbodyTrs else table.select("tr")
-
-                      for (tr in trs) {
-                          val tdEls = tr.select("td")
-                          val cells = mutableListOf<String>()
-                          for (td in tdEls) {
-                              cells.add(td.text().trim())
+                      if (rows.isEmpty()) {
+                          // Если строки лежат глубже или одним списком, разбиваем по структуре текста
+                          val allLeafTexts = groupEl.select("span, div, a, td")
+                              .filter { it.childrenSize() == 0 && it.text().trim().isNotEmpty() }
+                              .map { it.text().trim() }
+                          if (allLeafTexts.isNotEmpty()) {
+                              rows.add(allLeafTexts.take(12))
                           }
-                          if (cells.size >= 2 && cells.any { it.isNotEmpty() }) {
-                              bodyRows.add(cells)
+                      }
 
-                              val rowJoined = cells.joinToString(" | ")
-                              val scoreMatch = SCORE_REGEX.find(rowJoined)
-                              val isStandings = headers.any { it.equals("И", true) || it.equals("О", true) }
+                      parsedTables.add(
+                          ParsedTable(
+                              title = groupTitle,
+                              headers = listOf("#", "Команда / Данные группы"),
+                              rows = rows
+                          )
+                      )
+                  }
 
-                              if (scoreMatch != null && cells.size in 3..8 && !isStandings) {
-                                  val nonScoreCells = cells.filter { !SCORE_REGEX.containsMatchIn(it) && it.length > 2 }
-                                  val home = if (nonScoreCells.isNotEmpty()) nonScoreCells[0] else cells[0]
-                                  val away = if (nonScoreCells.size >= 2) nonScoreCells[1] else cells[cells.size - 1]
-                                  extractedMatches.add(
-                                      HockeyMatch(
-                                          id = "tbl_${idx}_${bodyRows.size}",
-                                          homeTeam = home,
-                                          awayTeam = away,
-                                          scoreText = scoreMatch.value,
-                                          infoLine = cells[0],
-                                          status = "МАТЧ",
-                                          rawDetails = rowJoined
+                  // 2. Ищем любые flex/grid строки во всем .tournament-wrapper
+                  val wrappers = doc.select(".tournament-wrapper")
+                  for (wIdx in 0 until wrappers.size) {
+                      val w = wrappers[wIdx]
+                      val allDivs = w.select("div, a, li")
+                      for (el in allDivs) {
+                          val childTexts = el.children().map { it.text().trim() }.filter { it.isNotEmpty() }
+                          val fullText = el.text().trim()
+
+                          // Проверка на карточку матча
+                          val scoreMatch = SCORE_REGEX.find(fullText)
+                          if (childTexts.size in 2..8 && fullText.length in 10..200) {
+                              val teamCandidates = childTexts.filter { it.length in 3..40 && !it.all { c -> c.isDigit() } && !it.contains("матчи", true) }
+                              if (teamCandidates.size >= 2 && scoreMatch != null) {
+                                  val home = teamCandidates[0]
+                                  val away = teamCandidates[1]
+                                  if (extractedMatches.none { it.homeTeam == home && it.awayTeam == away && it.scoreText == scoreMatch.value }) {
+                                      extractedMatches.add(
+                                          HockeyMatch(
+                                              id = "m_${extractedMatches.size}",
+                                              homeTeam = home,
+                                              awayTeam = away,
+                                              scoreText = scoreMatch.value,
+                                              infoLine = childTexts.firstOrNull() ?: h1,
+                                              status = "МАТЧ ФХМ",
+                                              rawDetails = childTexts.joinToString(" | ")
+                                          )
                                       )
-                                  )
-                              }
-
-                              val headerString = headers.joinToString(" ").lowercase()
-                              if (headerString.contains("игрок") || headerString.contains("бомбардир") || headerString.contains("фио")) {
-                                  extractedPlayers.add(cells)
-                              }
-                          }
-                      }
-
-                      if (bodyRows.isNotEmpty()) {
-                          val prevText = table.previousElementSibling()?.text()?.trim() ?: ""
-                          val tableName = if (prevText.isNotEmpty()) prevText.take(60) else "Таблица #${idx + 1}"
-                          parsedTables.add(ParsedTable(tableName, headers, bodyRows))
-                      }
-                  }
-
-                  val matchBlocks = doc.select("[class*=match], [class*=game], [class*=event], a[href*=match], a[href*=game], a[href*=protocol]")
-                  for (idx in 0 until matchBlocks.size) {
-                      val el = matchBlocks[idx]
-                      val text = el.text().trim()
-                      if (text.length in 10..180) {
-                          val scoreMatch = SCORE_REGEX.find(text)
-                          val subEls = el.select("[class*=team], [class*=name], [class*=club], span, div")
-                          val teamNames = mutableListOf<String>()
-                          for (sEl in subEls) {
-                              val own = sEl.ownText().trim()
-                              if (own.length in 3..35 && !own.all { ch -> ch.isDigit() } && !teamNames.contains(own)) {
-                                  teamNames.add(own)
+                                  }
                               }
                           }
 
-                          if (teamNames.size >= 2) {
-                              val score = scoreMatch?.value ?: "VS"
-                              val home = teamNames[0]
-                              val away = teamNames[1]
-                              if (extractedMatches.none { it.homeTeam == home && it.awayTeam == away && it.scoreText == score }) {
-                                  extractedMatches.add(
-                                      HockeyMatch(
-                                          id = "blk_$idx",
-                                          homeTeam = home,
-                                          awayTeam = away,
-                                          scoreText = score,
-                                          infoLine = "ФХМ • $tournamentTitle",
-                                          status = if (score == "VS") "РАСПИСАНИЕ" else "РЕЗУЛЬТАТ",
-                                          rawDetails = text
-                                      )
-                                  )
-                              }
+                          // Если это строка таблицы или игрока (много колонок с цифрами)
+                          val numericCount = childTexts.count { it.all { c -> c.isDigit() } && it.isNotEmpty() }
+                          if (childTexts.size >= 4 && numericCount >= 2) {
+                              extractedPlayers.add(childTexts)
                           }
                       }
                   }
 
-                  val classCounts = mutableMapOf<String, Int>()
-                  val classEls = doc.select("[class]")
-                  for (cEl in classEls) {
-                      for (cName in cEl.classNames()) {
-                          classCounts[cName] = (classCounts[cName] ?: 0) + 1
-                      }
-                  }
-                  val topClasses = classCounts.entries
-                      .sortedByDescending { it.value }
-                      .take(35)
-                      .joinToString(", ") { "${it.key}(${it.value})" }
+                  // 3. Детальный слепок ВНУТРЕННОСТЕЙ .tournament-wrapper и .standings-group для точной настройки
+                  val wrapperHtmlDump = wrappers.mapIndexed { idx, el ->
+                      "--- WRAPPER #$idx (class=${el.className()}) ---\n" +
+                          el.outerHtml().take(2500)
+                  }.joinToString("\n\n")
 
-                  val tabEls = doc.select("a[href*=tournament-tab], [class*=tab]")
-                  val tabLines = mutableListOf<String>()
-                  for (tEl in tabEls) {
-                      val line = "${tEl.text().trim()} -> ${tEl.attr("href")}"
-                      if (line.length > 5 && !tabLines.contains(line) && tabLines.size < 15) {
-                          tabLines.add(line)
-                      }
-                  }
-
-                  val blockEls = doc.select("table, [class*=table], [class*=match], [class*=stand], main, .content, div")
-                  val sampleLines = mutableListOf<String>()
-                  for (bEl in blockEls) {
-                      if (bEl.ownText().trim().isNotEmpty() || bEl.tagName() == "table") {
-                          val line = "${bEl.tagName()}.${bEl.className()}: ${bEl.text().take(140)}"
-                          if (line.length > 20 && !sampleLines.contains(line) && sampleLines.size < 18) {
-                              sampleLines.add(line)
-                          }
-                      }
-                  }
+                  val scriptsDump = doc.select("script")
+                      .map { it.attr("src") + " | " + it.data().take(200) }
+                      .filter { it.length > 5 }
+                      .joinToString("\n")
 
                   val report = buildString {
-                      appendLine("=== ОТЧЕТ ПАРСЕРА v2.1 (ТУРНИР 54) ===")
-                      appendLine("URL: $url")
-                      appendLine("Режим: ${if (usedWebView) "WebView (JS выполнен)" else "Прямой Jsoup"}")
-                      appendLine("Title: $docTitle")
-                      appendLine("H1/H2: $h1")
-                      appendLine("DOM-элементов: ${doc.allElements.size}")
-                      appendLine("Таблиц <table>: ${parsedTables.size}")
-                      appendLine("Матчей: ${extractedMatches.size}")
-                      appendLine("\n--- ВКЛАДКИ ТУРНИРА ---")
-                      appendLine(if (tabLines.isNotEmpty()) tabLines.joinToString("\n") else "Не обнаружены")
-                      appendLine("\n--- ТОП CSS-КЛАССОВ ---")
-                      appendLine(topClasses)
-                      for (i in 0 until parsedTables.size) {
-                          val t = parsedTables[i]
-                          appendLine("\n--- Таблица #${i + 1}: ${t.title} ---")
-                          appendLine("Шапка: ${t.headers.joinToString(" | ")}")
-                          t.rows.take(4).forEach { r ->
-                              appendLine("Строка: ${r.joinToString(" | ")}")
-                          }
-                      }
-                      appendLine("\n--- ТЕКСТОВЫЕ БЛОКИ НА СТРАНИЦЕ ---")
-                      appendLine(sampleLines.joinToString("\n---\n"))
+                      appendLine("=== ОТЧЕТ ПАРСЕРА v2.2 (SPA + AUTO-CLICK) ===")
+                      appendLine("URL: $url (Режим вкладки: $actionMode)")
+                      appendLine("Турнир: $h1")
+                      appendLine("Всего DOM-элементов после клика: ${doc.allElements.size}")
+                      appendLine("Найдено групп standings-group: ${standingGroups.size}")
+                      appendLine("Найдено матчей: ${extractedMatches.size}")
+                      appendLine("Найдено цифровых строк: ${extractedPlayers.size}")
+                      appendLine("\n=== ПЕРЕХВАЧЕННЫЕ XHR/FETCH ЗАПРОСЫ ===")
+                      appendLine(if (apiLogs.isNotEmpty()) apiLogs else "Запросы прошли до инициализации перехватчика")
+                      appendLine("\n=== СКРИПТЫ СТРАНИЦЫ ===")
+                      appendLine(scriptsDump.take(1200))
+                      appendLine("\n=== ИСХОДНЫЙ HTML ВНУТРИ .tournament-wrapper ===")
+                      appendLine(wrapperHtmlDump)
                   }
 
                   return TournamentPageData(
                       url = url,
-                      tournamentTitle = tournamentTitle,
+                      tournamentTitle = h1,
                       matches = extractedMatches,
                       tables = parsedTables,
                       playerRows = extractedPlayers,
@@ -498,7 +520,7 @@ jobs:
           val KhlTextGray = Color(0xFF8F9BB3)
 
           class MainActivity : ComponentActivity() {
-              override fun onCreate(savedInstanceState: Bundle?) {
+              override fun onCreate(savedInstanceState) {
                   super.onCreate(savedInstanceState)
                   setContent {
                       MaterialTheme(
@@ -509,20 +531,20 @@ jobs:
                               secondary = KhlIceBlue
                           )
                       ) {
-                          FhmKhlAppV2()
+                          FhmKhlAppV22()
                       }
                   }
               }
           }
 
           @Composable
-          fun FhmKhlAppV2() {
+          fun FhmKhlAppV22() {
               val context = LocalContext.current
               val scope = rememberCoroutineScope()
 
               var bottomTab by remember { mutableIntStateOf(1) }
               var tournamentId by remember { mutableStateOf("54") }
-              var siteTabIndex by remember { mutableIntStateOf(1) }
+              var actionMode by remember { mutableIntStateOf(1) } // 0=Матчи, 1=Таблица, 2=Игроки
 
               var pageData by remember { mutableStateOf<TournamentPageData?>(null) }
               var isLoading by remember { mutableStateOf(true) }
@@ -531,12 +553,12 @@ jobs:
               fun reload() {
                   scope.launch {
                       isLoading = true
-                      pageData = FhmTournamentParser.loadTournament(context, tournamentId, siteTabIndex)
+                      pageData = FhmTournamentParser.loadTournament(context, tournamentId, actionMode)
                       isLoading = false
                   }
               }
 
-              LaunchedEffect(tournamentId, siteTabIndex) {
+              LaunchedEffect(tournamentId, actionMode) {
                   reload()
               }
 
@@ -561,16 +583,16 @@ jobs:
                                       Box(modifier = Modifier.size(9.dp).clip(CircleShape).background(KhlAccentRed))
                                       Spacer(modifier = Modifier.width(8.dp))
                                       Text(
-                                          text = "ФХМ v2.1 • ТУРНИР #$tournamentId",
+                                          text = "ФХМ v2.2 • ТУРНИР #$tournamentId",
                                           color = KhlIceBlue,
                                           fontSize = 12.sp,
                                           fontWeight = FontWeight.Bold
                                       )
                                   }
                                   Text(
-                                      text = pageData?.tournamentTitle ?: "Загрузка tournament/$tournamentId...",
+                                      text = pageData?.tournamentTitle ?: "Загрузка...",
                                       color = Color.White,
-                                      fontSize = 15.sp,
+                                      fontSize = 14.sp,
                                       fontWeight = FontWeight.Black,
                                       maxLines = 1,
                                       overflow = TextOverflow.Ellipsis
@@ -588,21 +610,23 @@ jobs:
                                   .padding(horizontal = 12.dp, vertical = 6.dp),
                               horizontalArrangement = Arrangement.spacedBy(8.dp)
                           ) {
-                              val siteTabs = listOf(
-                                  1 to "Вкладка 1 (tab=1)",
-                                  2 to "Вкладка 2 (tab=2)",
-                                  3 to "Вкладка 3 (tab=3)",
-                                  4 to "Вкладка 4 (tab=4)"
+                              val modes = listOf(
+                                  0 to "Прошедшие матчи",
+                                  1 to "Таблица (3 группы)",
+                                  2 to "Лучшие игроки"
                               )
-                              siteTabs.forEach { pair ->
+                              modes.forEach { pair ->
                                   val idx = pair.first
                                   val label = pair.second
-                                  val active = siteTabIndex == idx
+                                  val active = actionMode == idx
                                   Box(
                                       modifier = Modifier
                                           .clip(RoundedCornerShape(16.dp))
                                           .background(if (active) KhlAccentRed else KhlBgDark)
-                                          .clickable { siteTabIndex = idx }
+                                          .clickable {
+                                              actionMode = idx
+                                              if (idx in 0..2 && bottomTab != 3) bottomTab = idx
+                                          }
                                           .padding(horizontal = 12.dp, vertical = 6.dp)
                                   ) {
                                       Text(
@@ -628,13 +652,13 @@ jobs:
                               selected = bottomTab == 1,
                               onClick = { bottomTab = 1 },
                               icon = { Icon(Icons.Default.FormatListNumbered, null) },
-                              label = { Text("Таблицы (${pageData?.tables?.size ?: 0})") }
+                              label = { Text("Группы (${pageData?.tables?.size ?: 0})") }
                           )
                           NavigationBarItem(
                               selected = bottomTab == 2,
                               onClick = { bottomTab = 2 },
                               icon = { Icon(Icons.Default.EmojiEvents, null) },
-                              label = { Text("Игроки") }
+                              label = { Text("Строки (${pageData?.playerRows?.size ?: 0})") }
                           )
                           NavigationBarItem(
                               selected = bottomTab == 3,
@@ -658,7 +682,7 @@ jobs:
                               CircularProgressIndicator(color = KhlAccentRed)
                               Spacer(modifier = Modifier.height(12.dp))
                               Text(
-                                  text = "Загрузка fhmoscow.com/tournament/$tournamentId?tournament-tab=$siteTabIndex...",
+                                  text = "Раскрываем вкладки и группы турнира #$tournamentId...",
                                   color = KhlTextGray,
                                   fontSize = 12.sp,
                                   textAlign = TextAlign.Center,
@@ -688,7 +712,7 @@ jobs:
                       },
                       text = {
                           Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                              Text("Счет / Статус: ${match.scoreText}", color = KhlIceBlue, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                              Text("Счет: ${match.scoreText}", color = KhlIceBlue, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                               Text(match.rawDetails, color = Color.White, fontSize = 13.sp)
                           }
                       },
@@ -706,7 +730,7 @@ jobs:
               if (data.matches.isEmpty()) {
                   Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
                       Text(
-                          text = "На вкладке ${data.url} карточки матчей не найдены.\n\nПопробуй переключить «Вкладка 2 (tab=2)» сверху или перейди на вкладку «Веб / DOM» внизу.",
+                          text = "Нажми сверху кнопку «Прошедшие матчи», либо открой вкладку «Веб / DOM» и скопируй HTML-код блока .tournament-wrapper.",
                           color = KhlTextGray,
                           fontSize = 14.sp,
                           textAlign = TextAlign.Center
@@ -755,7 +779,7 @@ jobs:
               if (data.tables.isEmpty()) {
                   Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
                       Text(
-                          text = "Таблицы <table> на странице ${data.url} не обнаружены.\n\nОткрой вкладку «Веб / DOM» внизу справа и нажми «Скопировать DOM», чтобы мы посмотрели верстку этой страницы.",
+                          text = "Группы не найдены. Открой вкладку «Веб / DOM» и нажми «Скопировать DOM».",
                           color = KhlTextGray,
                           fontSize = 14.sp,
                           textAlign = TextAlign.Center
@@ -773,60 +797,20 @@ jobs:
                       ) {
                           Column(modifier = Modifier.padding(12.dp)) {
                               Text(
-                                  text = table.title.uppercase(),
+                                  text = table.title,
                                   color = KhlIceBlue,
-                                  fontSize = 13.sp,
+                                  fontSize = 14.sp,
                                   fontWeight = FontWeight.Black,
                                   modifier = Modifier.padding(bottom = 8.dp)
                               )
-
-                              val scrollState = rememberScrollState()
-                              Column(modifier = Modifier.horizontalScroll(scrollState)) {
-                                  if (table.headers.isNotEmpty()) {
-                                      Row(
-                                          modifier = Modifier
-                                              .background(KhlBgDark, RoundedCornerShape(6.dp))
-                                              .padding(vertical = 8.dp, horizontal = 8.dp)
-                                      ) {
-                                          for (idx in 0 until table.headers.size) {
-                                              val h = table.headers[idx]
-                                              val w = if (idx == 1) 170.dp else 46.dp
-                                              Text(
-                                                  text = h,
-                                                  color = KhlTextGray,
-                                                  fontSize = 11.sp,
-                                                  fontWeight = FontWeight.Bold,
-                                                  modifier = Modifier.width(w).padding(horizontal = 4.dp)
-                                              )
-                                          }
-                                      }
-                                      Spacer(modifier = Modifier.height(4.dp))
-                                  }
-
-                                  for (rIdx in 0 until table.rows.size) {
-                                      val row = table.rows[rIdx]
-                                      Row(
-                                          modifier = Modifier
-                                              .background(if (rIdx % 2 == 0) Color.Transparent else KhlBgDark.copy(alpha = 0.45f))
-                                              .padding(vertical = 8.dp, horizontal = 8.dp),
-                                          verticalAlignment = Alignment.CenterVertically
-                                      ) {
-                                          for (cIdx in 0 until row.size) {
-                                              val cell = row[cIdx]
-                                              val w = if (cIdx == 1) 170.dp else 46.dp
-                                              val isHighlight = cIdx == 0 || cIdx == row.size - 1
-                                              Text(
-                                                  text = cell,
-                                                  color = if (isHighlight) KhlIceBlue else Color.White,
-                                                  fontWeight = if (cIdx <= 1 || cIdx == row.size - 1) FontWeight.Bold else FontWeight.Normal,
-                                                  fontSize = 12.sp,
-                                                  maxLines = 1,
-                                                  overflow = TextOverflow.Ellipsis,
-                                                  modifier = Modifier.width(w).padding(horizontal = 4.dp)
-                                              )
-                                          }
-                                      }
-                                  }
+                              for (rIdx in 0 until table.rows.size) {
+                                  val row = table.rows[rIdx]
+                                  Text(
+                                      text = row.joinToString("  |  "),
+                                      color = Color.White,
+                                      fontSize = 12.sp,
+                                      modifier = Modifier.padding(vertical = 4.dp)
+                                  )
                               }
                           }
                       }
@@ -836,12 +820,10 @@ jobs:
 
           @Composable
           fun LivePlayersScreen(data: TournamentPageData) {
-              val rows = if (data.playerRows.isNotEmpty()) data.playerRows else data.tables.lastOrNull()?.rows ?: emptyList()
-
-              if (rows.isEmpty()) {
+              if (data.playerRows.isEmpty()) {
                   Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
                       Text(
-                          text = "Переключи сверху «Вкладка 3 (tab=3)» или «Вкладка 4 (tab=4)», либо открой «Веб / DOM» внизу.",
+                          text = "Строки еще не загружены. Переключи режим сверху или проверь «Веб / DOM».",
                           color = KhlTextGray,
                           fontSize = 14.sp,
                           textAlign = TextAlign.Center
@@ -851,7 +833,7 @@ jobs:
               }
 
               LazyColumn(contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                  items(rows) { row ->
+                  items(data.playerRows) { row ->
                       Card(
                           colors = CardDefaults.cardColors(containerColor = KhlCardDark),
                           shape = RoundedCornerShape(10.dp),
@@ -965,11 +947,11 @@ jobs:
             exit 1
           }
 
-      - name: Rename APK to v2.1
-        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/fhm-tournament54-v2.apk
+      - name: Rename APK to v2.2
+        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/fhm-tournament54-v22.apk
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fhm-tournament54-v2
-          path: app/build/outputs/apk/debug/fhm-tournament54-v2.apk
+          name: fhm-tournament54-v22
+          path: app/build/outputs/apk/debug/fhm-tournament54-v22.apk
