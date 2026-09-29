@@ -1,4 +1,4 @@
-name: Build FHM v4.0 Turbo APK
+name: Build FHM v5.0 APK
 
 on:
   push:
@@ -25,10 +25,25 @@ jobs:
           unzip -q gradle-8.7-bin.zip -d /tmp
           echo "/tmp/gradle-8.7/bin" >> $GITHUB_PATH
 
-      - name: Generate v4.0 project
+      - name: Generate v5.0 project and download FHM logo
         run: |
           rm -rf app settings.gradle.kts build.gradle.kts gradle.properties
           mkdir -p app/src/main/java/com/fhm/khlstyle
+          mkdir -p app/src/main/res/mipmap-xxxhdpi
+
+          # Скачиваем официальную иконку с сайта fhmoscow.com для ярлыка Android-приложения
+          python3 -c '
+          import urllib.request, re
+          req = urllib.request.Request("https://fhmoscow.com/", headers={"User-Agent": "Mozilla/5.0"})
+          html = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", "ignore")
+          m = re.search(r"href=[\"'\'']([^\"'\'']*(?:apple-touch-icon|favicon-32x32)[^\"'\'']*\.png[^\"'\'']*)", html)
+          icon_url = m.group(1) if m else "https://fhmoscow.com/dist/releases/f607e3a7e98e97903485776be7a0b2d41afce96e/favicon/favicon-32x32.png"
+          if icon_url.startswith("/"):
+              icon_url = "https://fhmoscow.com" + icon_url
+          print("Downloading icon:", icon_url)
+          data = urllib.request.urlopen(urllib.request.Request(icon_url, headers={"User-Agent": "Mozilla/5.0"}), timeout=10).read()
+          open("app/src/main/res/mipmap-xxxhdpi/ic_launcher.png", "wb").write(data)
+          ' || true
 
           cat << 'EOF' > settings.gradle.kts
           pluginManagement {
@@ -45,7 +60,7 @@ jobs:
                   mavenCentral()
               }
           }
-          rootProject.name = "FHM_KHL_V40"
+          rootProject.name = "FHM_KHL_V50"
           include(":app")
           EOF
 
@@ -77,8 +92,8 @@ jobs:
                   applicationId = "com.fhm.khlstyle"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 40
-                  versionName = "4.0"
+                  versionCode = 50
+                  versionName = "5.0"
               }
 
               buildTypes {
@@ -112,6 +127,7 @@ jobs:
               implementation("org.jsoup:jsoup:1.17.2")
               implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
               implementation("io.coil-kt:coil-compose:2.6.0")
+              implementation("io.coil-kt:coil-svg:2.6.0")
           }
           EOF
 
@@ -121,7 +137,8 @@ jobs:
               <uses-permission android:name="android.permission.INTERNET" />
               <application
                   android:allowBackup="false"
-                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
                   android:label="ФХМ Матч-Центр"
                   android:supportsRtl="true"
                   android:usesCleartextTraffic="true"
@@ -162,6 +179,7 @@ jobs:
           import androidx.compose.material.icons.filled.Groups
           import androidx.compose.material.icons.filled.OpenInBrowser
           import androidx.compose.material.icons.filled.Refresh
+          import androidx.compose.material.icons.filled.Search
           import androidx.compose.material.icons.filled.SportsHockey
           import androidx.compose.material.icons.filled.SwapHoriz
           import androidx.compose.material3.*
@@ -177,7 +195,9 @@ jobs:
           import androidx.compose.ui.text.style.TextOverflow
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
+          import coil.ImageLoader
           import coil.compose.AsyncImage
+          import coil.decode.SvgDecoder
           import kotlinx.coroutines.Dispatchers
           import kotlinx.coroutines.async
           import kotlinx.coroutines.awaitAll
@@ -189,10 +209,16 @@ jobs:
           import org.jsoup.Connection
           import org.jsoup.Jsoup
 
-          // --- МОДЕЛИ ДАННЫХ ФХМ ---
-          data class FhmTournamentOption(
+          // --- МОДЕЛИ ДАННЫХ ---
+          data class FhmSeasonOption(
               val id: Int,
               val name: String
+          )
+
+          data class FhmTournamentOption(
+              val id: Int,
+              val name: String,
+              val birthYear: String
           )
 
           data class HockeyMatch(
@@ -260,20 +286,31 @@ jobs:
           data class TournamentPageData(
               val tournamentId: Int,
               val tournamentTitle: String,
+              val siteLogoUrl: String,
               val totalUpcomingCount: Int,
               val totalPastCount: Int,
               val upcomingMatches: List<HockeyMatch>,
               val pastMatches: List<HockeyMatch>,
               val standingGroups: List<StandingGroup>,
               val playersByCategory: Map<String, List<BestPlayerItem>>,
-              val availableTournaments: List<FhmTournamentOption>
+              val seasons: List<FhmSeasonOption>,
+              val selectedSeasonId: Int,
+              val tournamentsForSeason: List<FhmTournamentOption>
           )
 
-          // --- ПРЯМОЙ TURBO-КЛИЕНТ FHMOSCOW.COM (БЕЗ WEBVIEW!) ---
+          // --- КЛИЕНТ ПРЯМОГО API FHMOSCOW.COM ---
           object FhmDirectApiClient {
               private const val BASE_URL = "https://fhmoscow.com"
+              private const val DEFAULT_LOGO_URL =
+                  "https://fhmoscow.com/dist/releases/f607e3a7e98e97903485776be7a0b2d41afce96e/img/logo.svg"
               private const val USER_AGENT =
                   "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+
+              private val YEAR_REGEX = Regex("(20[012][0-9])")
+
+              private var cachedSeasons: List<FhmSeasonOption> = emptyList()
+              private val cachedTournamentsBySeason = mutableMapOf<Int, List<FhmTournamentOption>>()
+              private var cachedSiteLogo: String = DEFAULT_LOGO_URL
 
               private fun postApiJson(endpoint: String, payload: JSONObject, referer: String): String {
                   return try {
@@ -295,10 +332,74 @@ jobs:
                   }
               }
 
-              suspend fun loadFullTournament(tournamentId: Int): TournamentPageData = withContext(Dispatchers.IO) {
+              private fun parseArrayOrItems(raw: String): JSONArray {
+                  val trimmed = raw.trim()
+                  if (trimmed.isEmpty()) return JSONArray()
+                  return try {
+                      if (trimmed.startsWith("[")) {
+                          JSONArray(trimmed)
+                      } else if (trimmed.startsWith("{")) {
+                          val obj = JSONObject(trimmed)
+                          obj.optJSONArray("items") ?: obj.optJSONArray("data") ?: JSONArray()
+                      } else {
+                          JSONArray()
+                      }
+                  } catch (e: Exception) {
+                      JSONArray()
+                  }
+              }
+
+              private fun fetchSeasonsAndTournaments(requestedSeasonId: Int?, referer: String): Pair<Int, List<FhmTournamentOption>> {
+                  if (cachedSeasons.isEmpty()) {
+                      val rawSeasons = postApiJson("/api/filter/season", JSONObject(), referer)
+                      val arr = parseArrayOrItems(rawSeasons)
+                      val list = mutableListOf<FhmSeasonOption>()
+                      for (i in 0 until arr.length()) {
+                          val o = arr.optJSONObject(i) ?: continue
+                          val sid = o.optInt("id", o.optInt("value", 0))
+                          val sName = o.optString("name", o.optString("title", o.optString("label", "")))
+                          if (sid > 0 && sName.isNotEmpty()) {
+                              list.add(FhmSeasonOption(sid, sName))
+                          }
+                      }
+                      if (list.isNotEmpty()) cachedSeasons = list
+                  }
+
+                  val activeSeasonId = requestedSeasonId ?: cachedSeasons.firstOrNull()?.id ?: 0
+
+                  val existingTournaments = cachedTournamentsBySeason[activeSeasonId]
+                  if (!existingTournaments.isNullOrEmpty()) {
+                      return Pair(activeSeasonId, existingTournaments)
+                  }
+
+                  val req = JSONObject().apply {
+                      if (activeSeasonId > 0) put("season", activeSeasonId)
+                  }
+                  val rawTournaments = postApiJson("/api/filter/tournament", req, referer)
+                  val tArr = parseArrayOrItems(rawTournaments)
+                  val tList = mutableListOf<FhmTournamentOption>()
+                  for (i in 0 until tArr.length()) {
+                      val o = tArr.optJSONObject(i) ?: continue
+                      val tid = o.optInt("id", o.optInt("value", 0))
+                      val tName = o.optString("name", o.optString("title", ""))
+                      if (tid > 0 && tName.isNotEmpty()) {
+                          val yearMatch = YEAR_REGEX.find(tName)?.value ?: ""
+                          tList.add(FhmTournamentOption(tid, tName, yearMatch))
+                      }
+                  }
+
+                  if (tList.isNotEmpty()) {
+                      cachedTournamentsBySeason[activeSeasonId] = tList
+                  }
+                  return Pair(activeSeasonId, tList)
+              }
+
+              suspend fun loadFullTournament(
+                  tournamentId: Int,
+                  seasonId: Int? = null
+              ): TournamentPageData = withContext(Dispatchers.IO) {
                   val pageUrl = "$BASE_URL/tournament/$tournamentId"
 
-                  // 1. Быстрым GET-запросом (0.2 сек) берем название турнира и ID групп из тегов <details data-standings-group="...">
                   val doc = try {
                       Jsoup.connect(pageUrl)
                           .userAgent(USER_AGENT)
@@ -309,6 +410,15 @@ jobs:
                   }
 
                   val h1 = doc?.select("h1, h2")?.firstOrNull()?.text()?.trim() ?: "Турнир ФХМ #$tournamentId"
+
+                  // Извлекаем актуальную ссылку на логотип ФХМ с сайта
+                  if (doc != null) {
+                      val logoImg = doc.selectFirst("img[src*=logo]")?.attr("abs:src") ?: ""
+                      if (logoImg.isNotEmpty()) {
+                          cachedSiteLogo = logoImg
+                      }
+                  }
+
                   val groupDefs = mutableListOf<Pair<Int, String>>()
                   if (doc != null) {
                       val detailsEls = doc.select("details.standings-group")
@@ -321,26 +431,9 @@ jobs:
                       }
                   }
 
-                  // Получаем список всех доступных турниров с главной/фильтров
-                  val tournamentsList = mutableListOf<FhmTournamentOption>()
-                  if (doc != null) {
-                      val tLinks = doc.select("a[href*=/tournament/]")
-                      for (a in tLinks) {
-                          val href = a.attr("href")
-                          val tid = href.substringAfter("/tournament/").substringBefore("?").filter { it.isDigit() }.toIntOrNull()
-                          val tName = a.text().trim()
-                          if (tid != null && tName.length > 4 && tournamentsList.none { it.id == tid }) {
-                              tournamentsList.add(FhmTournamentOption(tid, tName))
-                          }
-                      }
-                  }
-
-                  // 2. ПАРАЛЛЕЛЬНО запрашиваем:
-                  // - 3 страницы прошедших матчей (offset = 0, 8, 16 -> 24 матча)
-                  // - 3 страницы будущих матчей (offset = 0, 8, 16 -> 24 матча)
-                  // - Все группы таблиц
-                  // - Все 6 номинаций игроков
                   coroutineScope {
+                      val catalogJob = async { fetchSeasonsAndTournaments(seasonId, pageUrl) }
+
                       val pastJobs = listOf(0, 8, 16).map { offset ->
                           async { fetchGamesPage(tournamentId, "-", offset, pageUrl) }
                       }
@@ -353,8 +446,7 @@ jobs:
                               async { fetchStandingGroup(tournamentId, gid, gName, pageUrl) }
                           }
                       } else {
-                          // Если турнир без деления на группы, пробуем group = null
-                          listOf(async { fetchStandingGroup(tournamentId, null, "Общая таблица", pageUrl) })
+                          listOf(async { fetchStandingGroup(tournamentId, null, "Турнирная таблица", pageUrl) })
                       }
 
                       val playerCategoriesSpec = listOf(
@@ -371,6 +463,7 @@ jobs:
                           async { Pair(title, fetchPlayersCategory(tournamentId, title, nom, role, pageUrl)) }
                       }
 
+                      val (activeSeasonId, catalogTournaments) = catalogJob.await()
                       val pastResults = pastJobs.awaitAll()
                       val upcomingResults = upcomingJobs.awaitAll()
                       val standingGroups = tableJobs.awaitAll().filter { it.rows.isNotEmpty() }
@@ -389,21 +482,47 @@ jobs:
                           }
                       }
 
+                      // Если API-фильтр не вернул список, добавляем текущий турнир и найденные на странице ссылки
+                      val finalTournaments = if (catalogTournaments.isNotEmpty()) {
+                          catalogTournaments
+                      } else {
+                          val fallback = mutableListOf<FhmTournamentOption>()
+                          val curYear = YEAR_REGEX.find(h1)?.value ?: ""
+                          fallback.add(FhmTournamentOption(tournamentId, h1, curYear))
+                          if (doc != null) {
+                              for (a in doc.select("a[href*=/tournament/]")) {
+                                  val tid = a.attr("href").substringAfter("/tournament/").substringBefore("?").filter { it.isDigit() }.toIntOrNull()
+                                  val tName = a.text().trim()
+                                  if (tid != null && tName.length > 4 && fallback.none { it.id == tid }) {
+                                      val y = YEAR_REGEX.find(tName)?.value ?: ""
+                                      fallback.add(FhmTournamentOption(tid, tName, y))
+                                  }
+                              }
+                          }
+                          fallback
+                      }
+
                       TournamentPageData(
                           tournamentId = tournamentId,
                           tournamentTitle = h1,
+                          siteLogoUrl = cachedSiteLogo,
                           totalUpcomingCount = maxOf(totalUpcoming, mergedUpcoming.size),
                           totalPastCount = maxOf(totalPast, mergedPast.size),
                           upcomingMatches = mergedUpcoming,
                           pastMatches = mergedPast,
                           standingGroups = standingGroups,
                           playersByCategory = playersMap,
-                          availableTournaments = tournamentsList
+                          seasons = cachedSeasons,
+                          selectedSeasonId = activeSeasonId,
+                          tournamentsForSeason = finalTournaments
                       )
                   }
               }
 
-              // Догрузка следующих 24 матчей (по 3 страницы за раз) при нажатии кнопки "Показать еще"
+              suspend fun loadTournamentsForSeason(seasonId: Int): List<FhmTournamentOption> = withContext(Dispatchers.IO) {
+                  fetchSeasonsAndTournaments(seasonId, BASE_URL).second
+              }
+
               suspend fun loadMoreMatches(
                   tournamentId: Int,
                   period: String,
@@ -509,7 +628,7 @@ jobs:
                       put("season", JSONObject.NULL)
                       put("tournament", tournamentId)
                       put("group", JSONObject.NULL)
-                      put("limit", 25)
+                      put("limit", 50)
                       put("nomination", nomination)
                       if (role != null) put("role", role) else put("role", JSONObject.NULL)
                   }
@@ -660,24 +779,36 @@ jobs:
                               secondary = KhlIceBlue
                           )
                       ) {
-                          FhmKhlAppV40()
+                          FhmKhlAppV50()
                       }
                   }
               }
           }
 
           @Composable
-          fun FhmKhlAppV40() {
+          fun FhmKhlAppV50() {
               val context = LocalContext.current
               val scope = rememberCoroutineScope()
 
-              var bottomTab by remember { mutableIntStateOf(0) } // 0=Матчи, 1=Таблица, 2=Игроки, 3=Клубы
-              var matchFilter by remember { mutableIntStateOf(1) } // 1=Прошедшие, 0=Ближайшие
+              // Декодер для векторного логотипа ФХМ (logo.svg)
+              val svgImageLoader = remember {
+                  ImageLoader.Builder(context)
+                      .components { add(SvgDecoder.Factory()) }
+                      .build()
+              }
+
+              var bottomTab by remember { mutableIntStateOf(0) }
+              var matchFilter by remember { mutableIntStateOf(1) }
               var selectedMatchGroup by remember { mutableStateOf("Все") }
               var selectedTeamFilter by remember { mutableStateOf<String?>(null) }
               var selectedTableGroupIdx by remember { mutableIntStateOf(0) }
               var selectedPlayerCatIdx by remember { mutableIntStateOf(0) }
+
+              var playerSearchQuery by remember { mutableStateOf("") }
+              var clubSearchQuery by remember { mutableStateOf("") }
+
               var tournamentId by remember { mutableIntStateOf(54) }
+              var selectedSeasonId by remember { mutableStateOf<Int?>(null) }
 
               var pageData by remember { mutableStateOf<TournamentPageData?>(null) }
               var pastList by remember { mutableStateOf<List<HockeyMatch>>(emptyList()) }
@@ -696,8 +827,11 @@ jobs:
                       selectedTableGroupIdx = 0
                       selectedPlayerCatIdx = 0
                       selectedTeamFilter = null
-                      val data = FhmDirectApiClient.loadFullTournament(tournamentId)
+                      val data = FhmDirectApiClient.loadFullTournament(tournamentId, selectedSeasonId)
                       pageData = data
+                      if (selectedSeasonId == null && data.selectedSeasonId > 0) {
+                          selectedSeasonId = data.selectedSeasonId
+                      }
                       pastList = data.pastMatches
                       upcomingList = data.upcomingMatches
                       isLoading = false
@@ -726,6 +860,17 @@ jobs:
                   pageData?.standingGroups?.flatMap { it.rows } ?: emptyList()
               }
 
+              // Группируем турниры сезона по годам рождения (2009..2017) для быстрого выбора года в шапке
+              val tournamentsList = pageData?.tournamentsForSeason ?: emptyList()
+              val birthYearsAvailable = remember(tournamentsList) {
+                  tournamentsList.map { it.birthYear }.filter { it.isNotEmpty() }.distinct().sortedDescending()
+              }
+              val currentBirthYear = remember(pageData, tournamentsList) {
+                  tournamentsList.find { it.id == tournamentId }?.birthYear
+                      ?: Regex("(20[012][0-9])").find(pageData?.tournamentTitle ?: "")?.value
+                      ?: ""
+              }
+
               Scaffold(
                   containerColor = KhlBgDark,
                   topBar = {
@@ -735,34 +880,54 @@ jobs:
                               .background(KhlCardDark)
                               .padding(top = 10.dp, bottom = 8.dp)
                       ) {
+                          // Верхняя панель с логотипом ФХМ и названием турнира
                           Row(
                               modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp),
                               horizontalArrangement = Arrangement.SpaceBetween,
                               verticalAlignment = Alignment.CenterVertically
                           ) {
-                              Column(modifier = Modifier.weight(1f).clickable { showTournamentPicker = true }) {
-                                  Row(verticalAlignment = Alignment.CenterVertically) {
-                                      Box(modifier = Modifier.size(9.dp).clip(CircleShape).background(KhlAccentRed))
-                                      Spacer(modifier = Modifier.width(8.dp))
+                              Row(
+                                  modifier = Modifier
+                                      .weight(1f)
+                                      .clickable { showTournamentPicker = true },
+                                  verticalAlignment = Alignment.CenterVertically
+                              ) {
+                                  AsyncImage(
+                                      model = pageData?.siteLogoUrl ?: "https://fhmoscow.com/dist/releases/f607e3a7e98e97903485776be7a0b2d41afce96e/img/logo.svg",
+                                      imageLoader = svgImageLoader,
+                                      contentDescription = "ФХМ",
+                                      contentScale = ContentScale.Fit,
+                                      modifier = Modifier
+                                          .size(38.dp)
+                                          .clip(RoundedCornerShape(8.dp))
+                                          .background(Color.White.copy(alpha = 0.08f))
+                                          .padding(4.dp)
+                                  )
+                                  Spacer(modifier = Modifier.width(10.dp))
+                                  Column(modifier = Modifier.weight(1f)) {
+                                      Row(verticalAlignment = Alignment.CenterVertically) {
+                                          Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(KhlAccentRed))
+                                          Spacer(modifier = Modifier.width(6.dp))
+                                          Text(
+                                              text = "ФЕДЕРАЦИЯ ХОККЕЯ МОСКВЫ",
+                                              color = KhlIceBlue,
+                                              fontSize = 10.sp,
+                                              fontWeight = FontWeight.Bold
+                                          )
+                                      }
                                       Text(
-                                          text = "ФХМ • МАТЧ-ЦЕНТР (ТУРНИР #$tournamentId)",
-                                          color = KhlIceBlue,
-                                          fontSize = 11.sp,
-                                          fontWeight = FontWeight.Bold
+                                          text = pageData?.tournamentTitle ?: "Загрузка турнира...",
+                                          color = Color.White,
+                                          fontSize = 14.sp,
+                                          fontWeight = FontWeight.Black,
+                                          maxLines = 1,
+                                          overflow = TextOverflow.Ellipsis
                                       )
                                   }
-                                  Text(
-                                      text = pageData?.tournamentTitle ?: "Загрузка...",
-                                      color = Color.White,
-                                      fontSize = 15.sp,
-                                      fontWeight = FontWeight.Black,
-                                      maxLines = 1,
-                                      overflow = TextOverflow.Ellipsis
-                                  )
                               }
                               Row {
                                   IconButton(onClick = { showTournamentPicker = true }) {
-                                      Icon(Icons.Default.SwapHoriz, contentDescription = "Сменить турнир", tint = KhlIceBlue)
+                                      Icon(Icons.Default.SwapHoriz, contentDescription = "Выбор года и турнира", tint = KhlIceBlue)
                                   }
                                   IconButton(onClick = { reload() }) {
                                       Icon(Icons.Default.Refresh, contentDescription = "Обновить", tint = Color.White)
@@ -770,10 +935,84 @@ jobs:
                               }
                           }
 
-                          // Шапка для вкладки 0 (Матчи)
+                          // Полоса быстрого выбора ГОДА РОЖДЕНИЯ (2017, 2016, 2015, 2014, 2013, 2012...)
+                          Row(
+                              modifier = Modifier
+                                  .fillMaxWidth()
+                                  .horizontalScroll(rememberScrollState())
+                                  .padding(horizontal = 12.dp, vertical = 6.dp),
+                              horizontalArrangement = Arrangement.spacedBy(6.dp),
+                              verticalAlignment = Alignment.CenterVertically
+                          ) {
+                              Box(
+                                  modifier = Modifier
+                                      .clip(RoundedCornerShape(14.dp))
+                                      .background(KhlIceBlue.copy(alpha = 0.2f))
+                                      .clickable { showTournamentPicker = true }
+                                      .padding(horizontal = 10.dp, vertical = 5.dp)
+                              ) {
+                                  Text(
+                                      text = "Все турниры (${tournamentsList.size})",
+                                      color = KhlIceBlue,
+                                      fontSize = 11.sp,
+                                      fontWeight = FontWeight.Bold
+                                  )
+                              }
+
+                              if (birthYearsAvailable.isNotEmpty()) {
+                                  birthYearsAvailable.forEach { yr ->
+                                      val isSelectedYear = yr == currentBirthYear
+                                      Box(
+                                          modifier = Modifier
+                                              .clip(RoundedCornerShape(14.dp))
+                                              .background(if (isSelectedYear) KhlAccentRed else KhlBgDark)
+                                              .clickable {
+                                                  val matchingTournaments = tournamentsList.filter { it.birthYear == yr }
+                                                  if (matchingTournaments.size == 1) {
+                                                      tournamentId = matchingTournaments.first().id
+                                                  } else if (matchingTournaments.size > 1) {
+                                                      // Если у этого года несколько турниров, переключаем на следующий или открываем выбор
+                                                      val nextT = matchingTournaments.firstOrNull { it.id != tournamentId } ?: matchingTournaments.first()
+                                                      tournamentId = nextT.id
+                                                  }
+                                              }
+                                              .padding(horizontal = 12.dp, vertical = 5.dp)
+                                      ) {
+                                          Text(
+                                              text = "$yr г.р.",
+                                              color = if (isSelectedYear) Color.White else KhlTextGray,
+                                              fontSize = 12.sp,
+                                              fontWeight = FontWeight.Bold
+                                          )
+                                      }
+                                  }
+                              } else {
+                                  // Если список годов еще грузится, показываем быстрые кнопки
+                                  val fallbackYears = listOf("2017", "2016", "2015", "2014", "2013", "2012", "2011", "2010", "2009")
+                                  fallbackYears.forEach { yr ->
+                                      val isSel = currentBirthYear == yr
+                                      Box(
+                                          modifier = Modifier
+                                              .clip(RoundedCornerShape(14.dp))
+                                              .background(if (isSel) KhlAccentRed else KhlBgDark)
+                                              .clickable { showTournamentPicker = true }
+                                              .padding(horizontal = 12.dp, vertical = 5.dp)
+                                      ) {
+                                          Text(
+                                              text = "$yr г.р.",
+                                              color = if (isSel) Color.White else KhlTextGray,
+                                              fontSize = 12.sp,
+                                              fontWeight = FontWeight.Bold
+                                          )
+                                      }
+                                  }
+                              }
+                          }
+
+                          // Фильтры для вкладки 0 (Матчи)
                           if (bottomTab == 0) {
                               Row(
-                                  modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                                  modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
                                   horizontalArrangement = Arrangement.spacedBy(8.dp)
                               ) {
                                   val totalPast = pageData?.totalPastCount ?: pastList.size
@@ -788,17 +1027,16 @@ jobs:
                                       val active = matchFilter == idx
                                       Box(
                                           modifier = Modifier
-                                              .clip(RoundedCornerShape(16.dp))
-                                              .background(if (active) KhlAccentRed else KhlBgDark)
+                                              .clip(RoundedCornerShape(14.dp))
+                                              .background(if (active) KhlIceBlue else KhlBgDark)
                                               .clickable { matchFilter = idx }
-                                              .padding(horizontal = 12.dp, vertical = 6.dp)
+                                              .padding(horizontal = 12.dp, vertical = 5.dp)
                                       ) {
-                                          Text(label, color = if (active) Color.White else KhlTextGray, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                          Text(label, color = if (active) Color.White else KhlTextGray, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                                       }
                                   }
                               }
 
-                              // Плашка выбранного клуба (если отфильтровано по команде)
                               if (selectedTeamFilter != null) {
                                   Row(
                                       modifier = Modifier
@@ -811,42 +1049,39 @@ jobs:
                                       horizontalArrangement = Arrangement.SpaceBetween,
                                       verticalAlignment = Alignment.CenterVertically
                                   ) {
-                                      Text(
-                                          text = "Команда: $selectedTeamFilter",
-                                          color = Color.White,
-                                          fontSize = 12.sp,
-                                          fontWeight = FontWeight.Bold
-                                      )
+                                      Text("Фильтр клуба: $selectedTeamFilter", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                                       Icon(Icons.Default.Close, contentDescription = "Сбросить", tint = KhlIceBlue, modifier = Modifier.size(16.dp))
                                   }
                               } else {
-                                  val groupOptions = listOf("Все") + (pageData?.standingGroups?.map { it.groupName } ?: listOf("Группа А", "Группа Б", "Группа В"))
-                                  Row(
-                                      modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 2.dp),
-                                      horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                  ) {
-                                      groupOptions.distinct().forEach { grp ->
-                                          val isSel = selectedMatchGroup == grp
-                                          Box(
-                                              modifier = Modifier
-                                                  .clip(RoundedCornerShape(8.dp))
-                                                  .background(if (isSel) KhlIceBlue.copy(alpha = 0.25f) else Color.Transparent)
-                                                  .clickable { selectedMatchGroup = grp }
-                                                  .padding(horizontal = 10.dp, vertical = 4.dp)
-                                          ) {
-                                              Text(grp, color = if (isSel) KhlIceBlue else KhlTextGray, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                  val groupOptions = listOf("Все") + (pageData?.standingGroups?.map { it.groupName } ?: emptyList())
+                                  if (groupOptions.size > 1) {
+                                      Row(
+                                          modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 2.dp),
+                                          horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                      ) {
+                                          groupOptions.distinct().forEach { grp ->
+                                              val isSel = selectedMatchGroup == grp
+                                              Box(
+                                                  modifier = Modifier
+                                                      .clip(RoundedCornerShape(8.dp))
+                                                      .background(if (isSel) KhlIceBlue.copy(alpha = 0.25f) else Color.Transparent)
+                                                      .clickable { selectedMatchGroup = grp }
+                                                      .padding(horizontal = 10.dp, vertical = 4.dp)
+                                              ) {
+                                                  Text(grp, color = if (isSel) KhlIceBlue else KhlTextGray, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                                              }
                                           }
                                       }
                                   }
                               }
                           }
 
-                          // Шапка для вкладки 1 (Таблица)
+                          // Фильтры для вкладки 1 (Таблица)
                           if (bottomTab == 1) {
                               val groups = pageData?.standingGroups ?: emptyList()
-                              if (groups.isNotEmpty()) {
+                              if (groups.size > 1) {
                                   Row(
-                                      modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 6.dp),
+                                      modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 4.dp),
                                       horizontalArrangement = Arrangement.spacedBy(8.dp)
                                   ) {
                                       for (idx in 0 until groups.size) {
@@ -854,10 +1089,10 @@ jobs:
                                           val active = selectedTableGroupIdx == idx
                                           Box(
                                               modifier = Modifier
-                                                  .clip(RoundedCornerShape(16.dp))
-                                                  .background(if (active) KhlAccentRed else KhlBgDark)
+                                                  .clip(RoundedCornerShape(14.dp))
+                                                  .background(if (active) KhlIceBlue else KhlBgDark)
                                                   .clickable { selectedTableGroupIdx = idx }
-                                                  .padding(horizontal = 14.dp, vertical = 6.dp)
+                                                  .padding(horizontal = 14.dp, vertical = 5.dp)
                                           ) {
                                               Text("${g.groupName} (${g.rows.size})", color = if (active) Color.White else KhlTextGray, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                                           }
@@ -866,10 +1101,10 @@ jobs:
                               }
                           }
 
-                          // Шапка для вкладки 2 (Лидеры / Игроки)
+                          // Фильтры для вкладки 2 (Лидеры)
                           if (bottomTab == 2 && playerCategories.isNotEmpty()) {
                               Row(
-                                  modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 6.dp),
+                                  modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 4.dp),
                                   horizontalArrangement = Arrangement.spacedBy(8.dp)
                               ) {
                                   for (idx in 0 until playerCategories.size) {
@@ -877,10 +1112,10 @@ jobs:
                                       val active = selectedPlayerCatIdx == idx
                                       Box(
                                           modifier = Modifier
-                                              .clip(RoundedCornerShape(16.dp))
-                                              .background(if (active) KhlAccentRed else KhlBgDark)
+                                              .clip(RoundedCornerShape(14.dp))
+                                              .background(if (active) KhlIceBlue else KhlBgDark)
                                               .clickable { selectedPlayerCatIdx = idx }
-                                              .padding(horizontal = 14.dp, vertical = 6.dp)
+                                              .padding(horizontal = 12.dp, vertical = 5.dp)
                                       ) {
                                           Text(catName, color = if (active) Color.White else KhlTextGray, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                                       }
@@ -923,11 +1158,7 @@ jobs:
                           Column(modifier = Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
                               CircularProgressIndicator(color = KhlAccentRed)
                               Spacer(modifier = Modifier.height(12.dp))
-                              Text(
-                                  text = "Прямая загрузка JSON API fhmoscow.com...",
-                                  color = KhlTextGray,
-                                  fontSize = 12.sp
-                              )
+                              Text("Загрузка данных ФХМ...", color = KhlTextGray, fontSize = 12.sp)
                           }
                       } else {
                           val data = pageData
@@ -966,12 +1197,16 @@ jobs:
                                       val playersList = data.playersByCategory[catKey] ?: emptyList()
                                       KhlPlayersScreen(
                                           players = playersList,
+                                          searchQuery = playerSearchQuery,
+                                          onSearchChange = { playerSearchQuery = it },
                                           onPlayerClick = { selectedPlayer = it }
                                       )
                                   }
                                   3 -> {
                                       ClubsDirectoryScreen(
                                           clubs = allClubs,
+                                          searchQuery = clubSearchQuery,
+                                          onSearchChange = { clubSearchQuery = it },
                                           onSelectClubMatches = { clubName ->
                                               selectedTeamFilter = clubName
                                               bottomTab = 0
@@ -985,42 +1220,95 @@ jobs:
                   }
               }
 
-              // Выбор турнира
+              // Модальное окно выбора Сезона, Года рождения и Турнира
               if (showTournamentPicker) {
-                  var customId by remember { mutableStateOf(tournamentId.toString()) }
-                  val defaultTournaments = listOf(
-                      FhmTournamentOption(54, "Кубок г. Москвы 2017 г.р. (4х4)"),
-                      FhmTournamentOption(53, "Турнир ФХМ #53"),
-                      FhmTournamentOption(52, "Турнир ФХМ #52"),
-                      FhmTournamentOption(51, "Турнир ФХМ #51"),
-                      FhmTournamentOption(50, "Турнир ФХМ #50"),
-                      FhmTournamentOption(49, "Турнир ФХМ #49"),
-                      FhmTournamentOption(48, "Турнир ФХМ #48")
-                  )
-                  val options = if (!pageData?.availableTournaments.isNullOrEmpty()) {
-                      pageData!!.availableTournaments
-                  } else {
-                      defaultTournaments
+                  var dialogSeasonId by remember { mutableIntStateOf(pageData?.selectedSeasonId ?: 0) }
+                  var dialogTournaments by remember { mutableStateOf(pageData?.tournamentsForSeason ?: emptyList()) }
+                  var dialogYearFilter by remember { mutableStateOf("Все") }
+                  var dialogSearch by remember { mutableStateOf("") }
+                  val seasonsList = pageData?.seasons ?: emptyList()
+
+                  val dialogYears = remember(dialogTournaments) {
+                      listOf("Все") + dialogTournaments.map { it.birthYear }.filter { it.isNotEmpty() }.distinct().sortedDescending()
+                  }
+
+                  val filteredDialogTournaments = dialogTournaments.filter { t ->
+                      val yearOk = dialogYearFilter == "Все" || t.birthYear == dialogYearFilter
+                      val searchOk = dialogSearch.isBlank() || t.name.contains(dialogSearch, ignoreCase = true)
+                      yearOk && searchOk
                   }
 
                   AlertDialog(
                       onDismissRequest = { showTournamentPicker = false },
                       containerColor = KhlCardDark,
-                      title = { Text("Выбор турнира ФХМ", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold) },
+                      title = {
+                          Text("Выбор сезона, года и турнира", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                      },
                       text = {
                           Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                              // Селектор сезона (26/27, 25/26, 24/25...)
+                              if (seasonsList.isNotEmpty()) {
+                                  Text("Сезон:", color = KhlTextGray, fontSize = 11.sp)
+                                  Row(
+                                      modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                      horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                  ) {
+                                      seasonsList.forEach { s ->
+                                          val isSel = s.id == dialogSeasonId
+                                          Box(
+                                              modifier = Modifier
+                                                  .clip(RoundedCornerShape(10.dp))
+                                                  .background(if (isSel) KhlAccentRed else KhlBgDark)
+                                                  .clickable {
+                                                      dialogSeasonId = s.id
+                                                      selectedSeasonId = s.id
+                                                      scope.launch {
+                                                          dialogTournaments = FhmDirectApiClient.loadTournamentsForSeason(s.id)
+                                                      }
+                                                  }
+                                                  .padding(horizontal = 10.dp, vertical = 6.dp)
+                                          ) {
+                                              Text(s.name, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                          }
+                                      }
+                                  }
+                              }
+
+                              // Фильтр по году рождения внутри диалога
+                              if (dialogYears.size > 1) {
+                                  Text("Год рождения:", color = KhlTextGray, fontSize = 11.sp)
+                                  Row(
+                                      modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                      horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                  ) {
+                                      dialogYears.forEach { y ->
+                                          val isSel = dialogYearFilter == y
+                                          Box(
+                                              modifier = Modifier
+                                                  .clip(RoundedCornerShape(10.dp))
+                                                  .background(if (isSel) KhlIceBlue else KhlBgDark)
+                                                  .clickable { dialogYearFilter = y }
+                                                  .padding(horizontal = 10.dp, vertical = 5.dp)
+                                          ) {
+                                              Text(if (y == "Все") "Все года" else "$y г.р.", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                          }
+                                      }
+                                  }
+                              }
+
                               OutlinedTextField(
-                                  value = customId,
-                                  onValueChange = { customId = it.filter { c -> c.isDigit() } },
-                                  label = { Text("ID турнира на fhmoscow.com") },
-                                  singleLine = true
+                                  value = dialogSearch,
+                                  onValueChange = { dialogSearch = it },
+                                  placeholder = { Text("Поиск турнира...", color = KhlTextGray, fontSize = 12.sp) },
+                                  singleLine = true,
+                                  modifier = Modifier.fillMaxWidth()
                               )
-                              Text("Турниры:", color = KhlTextGray, fontSize = 12.sp)
+
                               LazyColumn(
                                   modifier = Modifier.heightIn(max = 260.dp),
                                   verticalArrangement = Arrangement.spacedBy(6.dp)
                               ) {
-                                  items(options) { opt ->
+                                  items(filteredDialogTournaments) { opt ->
                                       Box(
                                           modifier = Modifier
                                               .fillMaxWidth()
@@ -1032,19 +1320,15 @@ jobs:
                                               }
                                               .padding(10.dp)
                                       ) {
-                                          Text("#${opt.id} — ${opt.name}", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                          Text(opt.name, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                                       }
                                   }
                               }
                           }
                       },
                       confirmButton = {
-                          TextButton(onClick = {
-                              val parsed = customId.toIntOrNull()
-                              if (parsed != null) tournamentId = parsed
-                              showTournamentPicker = false
-                          }) {
-                              Text("Перейти", color = KhlIceBlue)
+                          TextButton(onClick = { showTournamentPicker = false }) {
+                              Text("Закрыть", color = KhlIceBlue)
                           }
                       }
                   )
@@ -1203,6 +1487,42 @@ jobs:
           }
 
           @Composable
+          fun SearchFieldBar(
+              query: String,
+              placeholder: String,
+              onQueryChange: (String) -> Unit
+          ) {
+              OutlinedTextField(
+                  value = query,
+                  onValueChange = onQueryChange,
+                  placeholder = { Text(placeholder, color = KhlTextGray, fontSize = 13.sp) },
+                  leadingIcon = {
+                      Icon(Icons.Default.Search, contentDescription = null, tint = KhlIceBlue)
+                  },
+                  trailingIcon = {
+                      if (query.isNotEmpty()) {
+                          IconButton(onClick = { onQueryChange("") }) {
+                              Icon(Icons.Default.Close, contentDescription = "Очистить", tint = KhlTextGray)
+                          }
+                      }
+                  },
+                  singleLine = true,
+                  shape = RoundedCornerShape(12.dp),
+                  colors = OutlinedTextFieldDefaults.colors(
+                      focusedContainerColor = KhlCardDark,
+                      unfocusedContainerColor = KhlCardDark,
+                      focusedBorderColor = KhlIceBlue,
+                      unfocusedBorderColor = Color.Transparent,
+                      focusedTextColor = Color.White,
+                      unfocusedTextColor = Color.White
+                  ),
+                  modifier = Modifier
+                      .fillMaxWidth()
+                      .padding(horizontal = 12.dp, vertical = 8.dp)
+              )
+          }
+
+          @Composable
           fun StatMiniBox(label: String, value: String, highlight: Boolean = false) {
               Column(horizontalAlignment = Alignment.CenterHorizontally) {
                   Text(label, color = if (highlight) KhlAccentRed else KhlTextGray, fontSize = 10.sp, fontWeight = FontWeight.Bold)
@@ -1218,105 +1538,135 @@ jobs:
           @Composable
           fun KhlPlayersScreen(
               players: List<BestPlayerItem>,
+              searchQuery: String,
+              onSearchChange: (String) -> Unit,
               onPlayerClick: (BestPlayerItem) -> Unit
           ) {
-              if (players.isEmpty()) {
-                  Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-                      Text("В этой номинации пока нет данных.", color = KhlTextGray, fontSize = 14.sp)
+              val filteredPlayers = remember(players, searchQuery) {
+                  if (searchQuery.isBlank()) {
+                      players
+                  } else {
+                      val q = searchQuery.trim()
+                      players.filter { p ->
+                          p.fullName.contains(q, ignoreCase = true) ||
+                              p.clubName.contains(q, ignoreCase = true) ||
+                              p.number == q
+                      }
                   }
-                  return
               }
 
-              LazyColumn(contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                  items(players) { p ->
-                      Card(
-                          colors = CardDefaults.cardColors(containerColor = KhlCardDark),
-                          shape = RoundedCornerShape(14.dp),
-                          modifier = Modifier.fillMaxWidth().clickable { onPlayerClick(p) }
-                      ) {
-                          Row(
-                              modifier = Modifier.fillMaxWidth().padding(12.dp),
-                              verticalAlignment = Alignment.CenterVertically,
-                              horizontalArrangement = Arrangement.SpaceBetween
+              Column(modifier = Modifier.fillMaxSize()) {
+                  SearchFieldBar(
+                      query = searchQuery,
+                      placeholder = "Поиск игрока по фамилии, клубу или номеру...",
+                      onQueryChange = onSearchChange
+                  )
+
+                  if (filteredPlayers.isEmpty()) {
+                      Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+                          Text(
+                              text = if (searchQuery.isNotBlank()) "По запросу «$searchQuery» игроки не найдены." else "В этой номинации пока нет данных.",
+                              color = KhlTextGray,
+                              fontSize = 14.sp,
+                              textAlign = TextAlign.Center
+                          )
+                      }
+                      return@Column
+                  }
+
+                  LazyColumn(
+                      contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                      verticalArrangement = Arrangement.spacedBy(10.dp)
+                  ) {
+                      items(filteredPlayers) { p ->
+                          Card(
+                              colors = CardDefaults.cardColors(containerColor = KhlCardDark),
+                              shape = RoundedCornerShape(14.dp),
+                              modifier = Modifier.fillMaxWidth().clickable { onPlayerClick(p) }
                           ) {
                               Row(
-                                  modifier = Modifier.weight(1f),
-                                  verticalAlignment = Alignment.CenterVertically
+                                  modifier = Modifier.fillMaxWidth().padding(12.dp),
+                                  verticalAlignment = Alignment.CenterVertically,
+                                  horizontalArrangement = Arrangement.SpaceBetween
                               ) {
-                                  Text(
-                                      text = "${p.rank}",
-                                      color = if (p.rank <= 3) KhlAccentRed else KhlTextGray,
-                                      fontWeight = FontWeight.Black,
-                                      fontSize = 15.sp,
-                                      modifier = Modifier.width(24.dp)
-                                  )
-                                  AsyncImage(
-                                      model = p.playerPhoto,
-                                      contentDescription = p.fullName,
-                                      contentScale = ContentScale.Crop,
-                                      modifier = Modifier
-                                          .size(42.dp)
-                                          .clip(CircleShape)
-                                          .background(Color.White.copy(alpha = 0.08f))
-                                  )
-                                  Spacer(modifier = Modifier.width(10.dp))
-                                  Column(modifier = Modifier.weight(1f)) {
-                                      Row(verticalAlignment = Alignment.CenterVertically) {
+                                  Row(
+                                      modifier = Modifier.weight(1f),
+                                      verticalAlignment = Alignment.CenterVertically
+                                  ) {
+                                      Text(
+                                          text = "${p.rank}",
+                                          color = if (p.rank <= 3) KhlAccentRed else KhlTextGray,
+                                          fontWeight = FontWeight.Black,
+                                          fontSize = 15.sp,
+                                          modifier = Modifier.width(24.dp)
+                                      )
+                                      AsyncImage(
+                                          model = p.playerPhoto,
+                                          contentDescription = p.fullName,
+                                          contentScale = ContentScale.Crop,
+                                          modifier = Modifier
+                                              .size(42.dp)
+                                              .clip(CircleShape)
+                                              .background(Color.White.copy(alpha = 0.08f))
+                                      )
+                                      Spacer(modifier = Modifier.width(10.dp))
+                                      Column(modifier = Modifier.weight(1f)) {
+                                          Row(verticalAlignment = Alignment.CenterVertically) {
+                                              Text(
+                                                  text = p.shortName,
+                                                  color = Color.White,
+                                                  fontWeight = FontWeight.Bold,
+                                                  fontSize = 14.sp,
+                                                  maxLines = 1,
+                                                  overflow = TextOverflow.Ellipsis
+                                              )
+                                              if (p.number.isNotEmpty()) {
+                                                  Spacer(modifier = Modifier.width(6.dp))
+                                                  Text(
+                                                      text = "#${p.number}",
+                                                      color = KhlIceBlue,
+                                                      fontWeight = FontWeight.Black,
+                                                      fontSize = 12.sp
+                                                  )
+                                              }
+                                          }
                                           Text(
-                                              text = p.shortName,
-                                              color = Color.White,
-                                              fontWeight = FontWeight.Bold,
-                                              fontSize = 14.sp,
+                                              text = "${p.clubName} • ${p.roleName}",
+                                              color = KhlTextGray,
+                                              fontSize = 11.sp,
                                               maxLines = 1,
                                               overflow = TextOverflow.Ellipsis
                                           )
-                                          if (p.number.isNotEmpty()) {
-                                              Spacer(modifier = Modifier.width(6.dp))
-                                              Text(
-                                                  text = "#${p.number}",
-                                                  color = KhlIceBlue,
-                                                  fontWeight = FontWeight.Black,
-                                                  fontSize = 12.sp
-                                              )
-                                          }
                                       }
-                                      Text(
-                                          text = "${p.clubName} • ${p.roleName}",
-                                          color = KhlTextGray,
-                                          fontSize = 11.sp,
-                                          maxLines = 1,
-                                          overflow = TextOverflow.Ellipsis
-                                      )
                                   }
-                              }
 
-                              // Колонки И | Г | П | ОЧКИ как в КХЛ
-                              Row(
-                                  horizontalArrangement = Arrangement.spacedBy(10.dp),
-                                  verticalAlignment = Alignment.CenterVertically
-                              ) {
-                                  Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                      Text("И", color = KhlTextGray, fontSize = 10.sp)
-                                      Text("${p.games}", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                                  }
-                                  Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                      Text("Г", color = KhlTextGray, fontSize = 10.sp)
-                                      Text("${p.goals}", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                                  }
-                                  Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                      Text("П", color = KhlTextGray, fontSize = 10.sp)
-                                      Text("${p.assists}", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                                  }
-                                  Box(
-                                      modifier = Modifier
-                                          .clip(RoundedCornerShape(8.dp))
-                                          .background(KhlBgDark)
-                                          .padding(horizontal = 10.dp, vertical = 4.dp),
-                                      contentAlignment = Alignment.Center
+                                  Row(
+                                      horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                      verticalAlignment = Alignment.CenterVertically
                                   ) {
                                       Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                          Text(p.mainStatLabel, color = KhlAccentRed, fontSize = 9.sp, fontWeight = FontWeight.Bold)
-                                          Text(p.mainStatValue, color = KhlIceBlue, fontSize = 15.sp, fontWeight = FontWeight.Black)
+                                          Text("И", color = KhlTextGray, fontSize = 10.sp)
+                                          Text("${p.games}", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                      }
+                                      Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                          Text("Г", color = KhlTextGray, fontSize = 10.sp)
+                                          Text("${p.goals}", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                      }
+                                      Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                          Text("П", color = KhlTextGray, fontSize = 10.sp)
+                                          Text("${p.assists}", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                      }
+                                      Box(
+                                          modifier = Modifier
+                                              .clip(RoundedCornerShape(8.dp))
+                                              .background(KhlBgDark)
+                                              .padding(horizontal = 10.dp, vertical = 4.dp),
+                                          contentAlignment = Alignment.Center
+                                      ) {
+                                          Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                              Text(p.mainStatLabel, color = KhlAccentRed, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                                              Text(p.mainStatValue, color = KhlIceBlue, fontSize = 15.sp, fontWeight = FontWeight.Black)
+                                          }
                                       }
                                   }
                               }
@@ -1329,36 +1679,68 @@ jobs:
           @Composable
           fun ClubsDirectoryScreen(
               clubs: List<StandingRow>,
+              searchQuery: String,
+              onSearchChange: (String) -> Unit,
               onSelectClubMatches: (String) -> Unit,
               onClubDetails: (StandingRow) -> Unit
           ) {
-              LazyColumn(contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                  items(clubs) { club ->
-                      Card(
-                          colors = CardDefaults.cardColors(containerColor = KhlCardDark),
-                          shape = RoundedCornerShape(12.dp),
-                          modifier = Modifier.fillMaxWidth().clickable { onClubDetails(club) }
-                      ) {
-                          Row(
-                              modifier = Modifier.fillMaxWidth().padding(12.dp),
-                              verticalAlignment = Alignment.CenterVertically,
-                              horizontalArrangement = Arrangement.SpaceBetween
+              val filteredClubs = remember(clubs, searchQuery) {
+                  if (searchQuery.isBlank()) {
+                      clubs
+                  } else {
+                      val q = searchQuery.trim()
+                      clubs.filter { c ->
+                          c.teamName.contains(q, ignoreCase = true) ||
+                              c.groupName.contains(q, ignoreCase = true)
+                      }
+                  }
+              }
+
+              Column(modifier = Modifier.fillMaxSize()) {
+                  SearchFieldBar(
+                      query = searchQuery,
+                      placeholder = "Поиск клуба или группы (например: ЦСКА, Центр)...",
+                      onQueryChange = onSearchChange
+                  )
+
+                  if (filteredClubs.isEmpty()) {
+                      Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+                          Text("Клубы по запросу «$searchQuery» не найдены.", color = KhlTextGray, fontSize = 14.sp)
+                      }
+                      return@Column
+                  }
+
+                  LazyColumn(
+                      contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                      verticalArrangement = Arrangement.spacedBy(8.dp)
+                  ) {
+                      items(filteredClubs) { club ->
+                          Card(
+                              colors = CardDefaults.cardColors(containerColor = KhlCardDark),
+                              shape = RoundedCornerShape(12.dp),
+                              modifier = Modifier.fillMaxWidth().clickable { onClubDetails(club) }
                           ) {
-                              Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
-                                  AsyncImage(
-                                      model = club.logoUrl,
-                                      contentDescription = club.teamName,
-                                      contentScale = ContentScale.Fit,
-                                      modifier = Modifier.size(38.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.08f)).padding(4.dp)
-                                  )
-                                  Spacer(modifier = Modifier.width(10.dp))
-                                  Column {
-                                      Text(club.teamName, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                                      Text("${club.groupName} • Место: ${club.position} • Очки: ${club.points}", color = KhlTextGray, fontSize = 12.sp)
+                              Row(
+                                  modifier = Modifier.fillMaxWidth().padding(12.dp),
+                                  verticalAlignment = Alignment.CenterVertically,
+                                  horizontalArrangement = Arrangement.SpaceBetween
+                              ) {
+                                  Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+                                      AsyncImage(
+                                          model = club.logoUrl,
+                                          contentDescription = club.teamName,
+                                          contentScale = ContentScale.Fit,
+                                          modifier = Modifier.size(38.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.08f)).padding(4.dp)
+                                      )
+                                      Spacer(modifier = Modifier.width(10.dp))
+                                      Column {
+                                          Text(club.teamName, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                          Text("${club.groupName} • Место: ${club.position} • Очки: ${club.points}", color = KhlTextGray, fontSize = 12.sp)
+                                      }
                                   }
-                              }
-                              TextButton(onClick = { onSelectClubMatches(club.teamName) }) {
-                                  Text("Матчи ->", color = KhlIceBlue, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                  TextButton(onClick = { onSelectClubMatches(club.teamName) }) {
+                                      Text("Матчи ->", color = KhlIceBlue, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                  }
                               }
                           }
                       }
@@ -1418,7 +1800,7 @@ jobs:
                                   )
                                   Spacer(modifier = Modifier.width(8.dp))
                                   Text(
-                                      text = row.teamName.replace(" 2017", ""),
+                                      text = row.teamName,
                                       color = Color.White,
                                       fontWeight = FontWeight.Bold,
                                       fontSize = 13.sp,
@@ -1539,11 +1921,11 @@ jobs:
             exit 1
           }
 
-      - name: Rename APK to v4.0
-        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/fhm-khl-v40.apk
+      - name: Rename APK to v5.0
+        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/fhm-khl-v50.apk
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fhm-khl-v40
-          path: app/build/outputs/apk/debug/fhm-khl-v40.apk
+          name: fhm-khl-v50
+          path: app/build/outputs/apk/debug/fhm-khl-v50.apk
