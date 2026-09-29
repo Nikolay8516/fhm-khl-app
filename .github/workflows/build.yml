@@ -1,4 +1,4 @@
-name: Build FHM v5.0 APK
+name: Build FHM v5.1 APK
 
 on:
   push:
@@ -25,23 +25,35 @@ jobs:
           unzip -q gradle-8.7-bin.zip -d /tmp
           echo "/tmp/gradle-8.7/bin" >> $GITHUB_PATH
 
-      - name: Generate v5.0 project and download FHM logo
+      - name: Generate v5.1 project and HD 512x512 FHM Icon
         run: |
           rm -rf app settings.gradle.kts build.gradle.kts gradle.properties
           mkdir -p app/src/main/java/com/fhm/khlstyle
+          mkdir -p app/src/main/res/mipmap-mdpi
+          mkdir -p app/src/main/res/mipmap-hdpi
+          mkdir -p app/src/main/res/mipmap-xhdpi
+          mkdir -p app/src/main/res/mipmap-xxhdpi
           mkdir -p app/src/main/res/mipmap-xxxhdpi
 
+          # Скачиваем векторный logo.svg с fhmoscow.com и рендерим четкую HD-иконку 512x512 (без мыла!)
+          sudo apt-get update -qq && sudo apt-get install -y -qq librsvg2-bin imagemagick || true
           python3 -c '
-          import urllib.request, re
+          import urllib.request, re, subprocess
           req = urllib.request.Request("https://fhmoscow.com/", headers={"User-Agent": "Mozilla/5.0"})
           html = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", "ignore")
-          m = re.search(r"href=[\"\x27]([^\"\x27]*(?:apple-touch-icon|favicon-32x32)[^\"\x27]*\.png[^\"\x27]*)", html)
-          icon_url = m.group(1) if m else "https://fhmoscow.com/dist/releases/f607e3a7e98e97903485776be7a0b2d41afce96e/favicon/favicon-32x32.png"
-          if icon_url.startswith("/"):
-              icon_url = "https://fhmoscow.com" + icon_url
-          data = urllib.request.urlopen(urllib.request.Request(icon_url, headers={"User-Agent": "Mozilla/5.0"}), timeout=10).read()
-          open("app/src/main/res/mipmap-xxxhdpi/ic_launcher.png", "wb").write(data)
-          ' || true
+          m = re.search(r"src=[\"\x27]([^\"\x27]*logo\.svg[^\"\x27]*)", html)
+          svg_url = m.group(1) if m else "https://fhmoscow.com/dist/releases/f607e3a7e98e97903485776be7a0b2d41afce96e/img/logo.svg"
+          if svg_url.startswith("/"):
+              svg_url = "https://fhmoscow.com" + svg_url
+          svg_data = urllib.request.urlopen(urllib.request.Request(svg_url, headers={"User-Agent": "Mozilla/5.0"}), timeout=10).read()
+          open("/tmp/fhm_logo.svg", "wb").write(svg_data)
+          '
+          rsvg-convert -w 420 -h 420 --keep-aspect-ratio /tmp/fhm_logo.svg -o /tmp/fhm_raw.png
+          convert -size 512x512 xc:"#0B101B" /tmp/fhm_raw.png -gravity center -composite /tmp/ic_512.png
+          for dir in mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
+            cp /tmp/ic_512.png app/src/main/res/$dir/ic_launcher.png
+            cp /tmp/ic_512.png app/src/main/res/$dir/ic_launcher_round.png
+          done
 
           cat << 'EOF' > settings.gradle.kts
           pluginManagement {
@@ -58,7 +70,7 @@ jobs:
                   mavenCentral()
               }
           }
-          rootProject.name = "FHM_KHL_V50"
+          rootProject.name = "FHM_KHL_V51"
           include(":app")
           EOF
 
@@ -90,8 +102,8 @@ jobs:
                   applicationId = "com.fhm.khlstyle"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 50
-                  versionName = "5.0"
+                  versionCode = 51
+                  versionName = "5.1"
               }
 
               buildTypes {
@@ -136,7 +148,7 @@ jobs:
               <application
                   android:allowBackup="false"
                   android:icon="@mipmap/ic_launcher"
-                  android:roundIcon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher_round"
                   android:label="ФХМ Матч-Центр"
                   android:supportsRtl="true"
                   android:usesCleartextTraffic="true"
@@ -200,6 +212,7 @@ jobs:
           import kotlinx.coroutines.async
           import kotlinx.coroutines.awaitAll
           import kotlinx.coroutines.coroutineScope
+          import kotlinx.coroutines.delay
           import kotlinx.coroutines.launch
           import kotlinx.coroutines.withContext
           import org.json.JSONArray
@@ -278,6 +291,7 @@ jobs:
               val pastMatches: List<HockeyMatch>,
               val standingGroups: List<StandingGroup>,
               val playersByCategory: Map<String, List<BestPlayerItem>>,
+              val allUniquePlayers: List<BestPlayerItem>,
               val seasons: List<FhmSeasonOption>,
               val selectedSeasonId: Int,
               val tournamentsForSeason: List<FhmTournamentOption>
@@ -295,25 +309,33 @@ jobs:
               private var cachedSeasons: List<FhmSeasonOption> = emptyList()
               private val cachedTournamentsBySeason = mutableMapOf<Int, List<FhmTournamentOption>>()
               private var cachedSiteLogo: String = DEFAULT_LOGO_URL
+              private val sessionCookies = mutableMapOf<String, String>()
 
-              private fun postApiJson(endpoint: String, payload: JSONObject, referer: String): String {
-                  return try {
-                      Jsoup.connect("$BASE_URL$endpoint")
-                          .userAgent(USER_AGENT)
-                          .header("Content-Type", "application/json")
-                          .header("Accept", "application/json, text/plain, */*")
-                          .header("X-Requested-With", "XMLHttpRequest")
-                          .referrer(referer)
-                          .ignoreContentType(true)
-                          .maxBodySize(0)
-                          .timeout(10000)
-                          .method(Connection.Method.POST)
-                          .requestBody(payload.toString())
-                          .execute()
-                          .body()
-                  } catch (e: Exception) {
-                      ""
+              // Надежный POST-запрос с сохранением cookies и автоматическим повтором (retry), чтобы ни одна категория не терялась!
+              private suspend fun postApiJsonWithRetry(endpoint: String, payload: JSONObject, referer: String): String {
+                  repeat(3) { attempt ->
+                      try {
+                          val res = Jsoup.connect("$BASE_URL$endpoint")
+                              .userAgent(USER_AGENT)
+                              .cookies(sessionCookies)
+                              .header("Content-Type", "application/json")
+                              .header("Accept", "application/json, text/plain, */*")
+                              .header("X-Requested-With", "XMLHttpRequest")
+                              .referrer(referer)
+                              .ignoreContentType(true)
+                              .maxBodySize(0)
+                              .timeout(12000)
+                              .method(Connection.Method.POST)
+                              .requestBody(payload.toString())
+                              .execute()
+                          sessionCookies.putAll(res.cookies())
+                          val body = res.body()
+                          if (body.isNotEmpty()) return body
+                      } catch (e: Exception) {
+                          if (attempt < 2) delay(250L * (attempt + 1))
+                      }
                   }
+                  return ""
               }
 
               private fun parseArrayOrItems(raw: String): JSONArray {
@@ -333,9 +355,23 @@ jobs:
                   }
               }
 
-              private fun fetchSeasonsAndTournaments(requestedSeasonId: Int?, referer: String): Pair<Int, List<FhmTournamentOption>> {
+              // Приоритетная сортировка турниров внутри года рождения:
+              // Сначала "Первенство г. Москвы" и "Кубок г. Москвы" (где Группы А, Б, В), а потом "Первый этап / Кубок ФХМ"
+              fun prioritizeTournaments(list: List<FhmTournamentOption>): List<FhmTournamentOption> {
+                  return list.sortedWith(compareBy<FhmTournamentOption> { opt ->
+                      val lower = opt.name.lowercase()
+                      when {
+                          lower.contains("первенство") && lower.contains("москв") -> 1
+                          lower.contains("кубок") && lower.contains("москв") -> 2
+                          lower.contains("этап") -> 4
+                          else -> 3
+                      }
+                  }.thenByDescending { it.id })
+              }
+
+              private suspend fun fetchSeasonsAndTournaments(requestedSeasonId: Int?, referer: String): Pair<Int, List<FhmTournamentOption>> {
                   if (cachedSeasons.isEmpty()) {
-                      val rawSeasons = postApiJson("/api/filter/season", JSONObject(), referer)
+                      val rawSeasons = postApiJsonWithRetry("/api/filter/season", JSONObject(), referer)
                       val arr = parseArrayOrItems(rawSeasons)
                       val list = mutableListOf<FhmSeasonOption>()
                       for (i in 0 until arr.length()) {
@@ -356,7 +392,7 @@ jobs:
                   val req = JSONObject().apply {
                       if (activeSeasonId > 0) put("season", activeSeasonId)
                   }
-                  val rawTournaments = postApiJson("/api/filter/tournament", req, referer)
+                  val rawTournaments = postApiJsonWithRetry("/api/filter/tournament", req, referer)
                   val tArr = parseArrayOrItems(rawTournaments)
                   val tList = mutableListOf<FhmTournamentOption>()
                   for (i in 0 until tArr.length()) {
@@ -369,8 +405,9 @@ jobs:
                       }
                   }
 
-                  if (tList.isNotEmpty()) cachedTournamentsBySeason[activeSeasonId] = tList
-                  return Pair(activeSeasonId, tList)
+                  val sortedList = prioritizeTournaments(tList)
+                  if (sortedList.isNotEmpty()) cachedTournamentsBySeason[activeSeasonId] = sortedList
+                  return Pair(activeSeasonId, sortedList)
               }
 
               suspend fun loadFullTournament(
@@ -380,7 +417,9 @@ jobs:
                   val pageUrl = "$BASE_URL/tournament/$tournamentId"
 
                   val doc = try {
-                      Jsoup.connect(pageUrl).userAgent(USER_AGENT).timeout(8000).get()
+                      val conn = Jsoup.connect(pageUrl).userAgent(USER_AGENT).timeout(10000).execute()
+                      sessionCookies.putAll(conn.cookies())
+                      conn.parse()
                   } catch (e: Exception) {
                       null
                   }
@@ -413,6 +452,12 @@ jobs:
                           listOf(async { fetchStandingGroup(tournamentId, null, "Турнирная таблица", pageUrl) })
                       }
 
+                      val (activeSeasonId, catalogTournaments) = catalogJob.await()
+                      val pastResults = pastJobs.awaitAll()
+                      val upcomingResults = upcomingJobs.awaitAll()
+                      val standingGroups = tableJobs.awaitAll().filter { it.rows.isNotEmpty() }
+
+                      // Запрашиваем номинации игроков последовательными микро-пачками (по 2), чтобы сервер ФХМ гарантированно отдавал все 7 категорий!
                       val playerCategoriesSpec = listOf(
                           Triple("Бомбардиры", "bomber", null),
                           Triple("Снайперы", "sniper", null),
@@ -423,45 +468,25 @@ jobs:
                           Triple("Вратари", "goalkeeper", null)
                       )
 
-                      val playerJobs = playerCategoriesSpec.map { (title, nom, role) ->
-                          async { Pair(title, fetchPlayersCategory(tournamentId, title, nom, role, pageUrl)) }
+                      val playersMap = linkedMapOf<String, List<BestPlayerItem>>()
+                      for (chunk in playerCategoriesSpec.chunked(2)) {
+                          val chunkResults = chunk.map { (title, nom, role) ->
+                              async { Pair(title, fetchPlayersCategory(tournamentId, title, nom, role, pageUrl)) }
+                          }.awaitAll()
+                          for ((title, list) in chunkResults) {
+                              if (list.isNotEmpty()) {
+                                  playersMap[title] = list
+                              }
+                          }
                       }
 
-                      val (activeSeasonId, catalogTournaments) = catalogJob.await()
-                      val pastResults = pastJobs.awaitAll()
-                      val upcomingResults = upcomingJobs.awaitAll()
-                      val standingGroups = tableJobs.awaitAll().filter { it.rows.isNotEmpty() }
-                      val playerResults = playerJobs.awaitAll()
+                      val allUnique = playersMap.values.flatten().distinctBy { "${it.id}_${it.categoryTitle}" }
 
                       val totalPast = pastResults.maxOfOrNull { it.first } ?: 0
                       val totalUpcoming = upcomingResults.maxOfOrNull { it.first } ?: 0
 
                       val mergedPast = pastResults.flatMap { it.second }.distinctBy { it.id }
                       val mergedUpcoming = upcomingResults.flatMap { it.second }.distinctBy { it.id }
-
-                      val playersMap = linkedMapOf<String, List<BestPlayerItem>>()
-                      for ((title, list) in playerResults) {
-                          if (list.isNotEmpty()) playersMap[title] = list
-                      }
-
-                      val finalTournaments = if (catalogTournaments.isNotEmpty()) {
-                          catalogTournaments
-                      } else {
-                          val fallback = mutableListOf<FhmTournamentOption>()
-                          val curYear = YEAR_REGEX.find(h1)?.value ?: ""
-                          fallback.add(FhmTournamentOption(tournamentId, h1, curYear))
-                          if (doc != null) {
-                              for (a in doc.select("a[href*=/tournament/]")) {
-                                  val tid = a.attr("href").substringAfter("/tournament/").substringBefore("?").filter { it.isDigit() }.toIntOrNull()
-                                  val tName = a.text().trim()
-                                  if (tid != null && tName.length > 4 && fallback.none { it.id == tid }) {
-                                      val y = YEAR_REGEX.find(tName)?.value ?: ""
-                                      fallback.add(FhmTournamentOption(tid, tName, y))
-                                  }
-                              }
-                          }
-                          fallback
-                      }
 
                       TournamentPageData(
                           tournamentId = tournamentId,
@@ -473,9 +498,10 @@ jobs:
                           pastMatches = mergedPast,
                           standingGroups = standingGroups,
                           playersByCategory = playersMap,
+                          allUniquePlayers = allUnique,
                           seasons = cachedSeasons,
                           selectedSeasonId = activeSeasonId,
-                          tournamentsForSeason = finalTournaments
+                          tournamentsForSeason = catalogTournaments
                       )
                   }
               }
@@ -495,7 +521,7 @@ jobs:
                   }
               }
 
-              private fun fetchGamesPage(tournamentId: Int, period: String, offset: Int, referer: String): Pair<Int, List<HockeyMatch>> {
+              private suspend fun fetchGamesPage(tournamentId: Int, period: String, offset: Int, referer: String): Pair<Int, List<HockeyMatch>> {
                   val req = JSONObject().apply {
                       put("dateFrom", JSONObject.NULL)
                       put("dateTo", JSONObject.NULL)
@@ -505,7 +531,7 @@ jobs:
                       put("period", period)
                       put("tournament", tournamentId)
                   }
-                  val body = postApiJson("/api/game/list", req, referer)
+                  val body = postApiJsonWithRetry("/api/game/list", req, referer)
                   if (!body.startsWith("{")) return Pair(0, emptyList())
 
                   return try {
@@ -523,12 +549,12 @@ jobs:
                   }
               }
 
-              private fun fetchStandingGroup(tournamentId: Int, groupId: Int?, groupName: String, referer: String): StandingGroup {
+              private suspend fun fetchStandingGroup(tournamentId: Int, groupId: Int?, groupName: String, referer: String): StandingGroup {
                   val req = JSONObject().apply {
                       put("tournament", tournamentId)
                       if (groupId != null) put("group", groupId) else put("group", JSONObject.NULL)
                   }
-                  val body = postApiJson("/api/tournamentTable/list", req, referer)
+                  val body = postApiJsonWithRetry("/api/tournamentTable/list", req, referer)
                   if (!body.startsWith("{")) return StandingGroup(groupId ?: 0, groupName, emptyList())
 
                   return try {
@@ -564,7 +590,7 @@ jobs:
                   }
               }
 
-              private fun fetchPlayersCategory(tournamentId: Int, categoryTitle: String, nomination: String, role: Int?, referer: String): List<BestPlayerItem> {
+              private suspend fun fetchPlayersCategory(tournamentId: Int, categoryTitle: String, nomination: String, role: Int?, referer: String): List<BestPlayerItem> {
                   val req = JSONObject().apply {
                       put("season", JSONObject.NULL)
                       put("tournament", tournamentId)
@@ -573,7 +599,7 @@ jobs:
                       put("nomination", nomination)
                       if (role != null) put("role", role) else put("role", JSONObject.NULL)
                   }
-                  val body = postApiJson("/api/playerStatistic/list", req, referer)
+                  val body = postApiJsonWithRetry("/api/playerStatistic/list", req, referer)
                   if (!body.startsWith("{")) return emptyList()
 
                   return try {
@@ -715,14 +741,14 @@ jobs:
                               secondary = KhlIceBlue
                           )
                       ) {
-                          FhmKhlAppV50()
+                          FhmKhlAppV51()
                       }
                   }
               }
           }
 
           @Composable
-          fun FhmKhlAppV50() {
+          fun FhmKhlAppV51() {
               val context = LocalContext.current
               val scope = rememberCoroutineScope()
 
@@ -732,7 +758,7 @@ jobs:
                       .build()
               }
 
-              var bottomTab by remember { mutableIntStateOf(0) }
+              var bottomTab by remember { mutableIntStateOf(1) }
               var matchFilter by remember { mutableIntStateOf(1) }
               var selectedMatchGroup by remember { mutableStateOf("Все") }
               var selectedTeamFilter by remember { mutableStateOf<String?>(null) }
@@ -805,6 +831,15 @@ jobs:
                       ?: ""
               }
 
+              // Все турниры выбранного года рождения (например: 1) Кубок г. Москвы 2017 (4х4) и 2) Кубок ФХМ 2017 Первый этап)
+              val sameYearTournaments = remember(tournamentsList, currentBirthYear) {
+                  if (currentBirthYear.isNotEmpty()) {
+                      tournamentsList.filter { it.birthYear == currentBirthYear }
+                  } else {
+                      emptyList()
+                  }
+              }
+
               Scaffold(
                   containerColor = KhlBgDark,
                   topBar = {
@@ -866,11 +901,12 @@ jobs:
                               }
                           }
 
+                          // Полоса 1: Выбор ГОДА РОЖДЕНИЯ
                           Row(
                               modifier = Modifier
                                   .fillMaxWidth()
                                   .horizontalScroll(rememberScrollState())
-                                  .padding(horizontal = 12.dp, vertical = 6.dp),
+                                  .padding(horizontal = 12.dp, vertical = 4.dp),
                               horizontalArrangement = Arrangement.spacedBy(6.dp),
                               verticalAlignment = Alignment.CenterVertically
                           ) {
@@ -902,10 +938,12 @@ jobs:
                                           .clip(RoundedCornerShape(14.dp))
                                           .background(if (isSelectedYear) KhlAccentRed else KhlBgDark)
                                           .clickable {
-                                              val matchingTournaments = tournamentsList.filter { it.birthYear == yr }
-                                              if (matchingTournaments.isNotEmpty()) {
-                                                  val nextT = matchingTournaments.firstOrNull { it.id != tournamentId } ?: matchingTournaments.first()
-                                                  tournamentId = nextT.id
+                                              val matching = FhmDirectApiClient.prioritizeTournaments(
+                                                  tournamentsList.filter { it.birthYear == yr }
+                                              )
+                                              if (matching.isNotEmpty()) {
+                                                  // Всегда открываем ГЛАВНЫЙ турнир этого года (Первенство/Кубок Москвы с Группами А, Б, В!)
+                                                  tournamentId = matching.first().id
                                               } else {
                                                   showTournamentPicker = true
                                               }
@@ -922,9 +960,40 @@ jobs:
                               }
                           }
 
+                          // Полоса 2: Если у выбранного года рождения несколько турниров (например, "Кубок г. Москвы (Группы А,Б,В)" и "Кубок ФХМ Первый этап"),
+                          // показываем удобный переключатель между ними прямо здесь!
+                          if (sameYearTournaments.size > 1) {
+                              Row(
+                                  modifier = Modifier
+                                      .fillMaxWidth()
+                                      .horizontalScroll(rememberScrollState())
+                                      .padding(horizontal = 12.dp, vertical = 2.dp),
+                                  horizontalArrangement = Arrangement.spacedBy(6.dp)
+                              ) {
+                                  sameYearTournaments.forEach { tOpt ->
+                                      val isCurrentT = tOpt.id == tournamentId
+                                      Box(
+                                          modifier = Modifier
+                                              .clip(RoundedCornerShape(10.dp))
+                                              .background(if (isCurrentT) KhlIceBlue.copy(alpha = 0.28f) else KhlBgDark.copy(alpha = 0.7f))
+                                              .clickable { tournamentId = tOpt.id }
+                                              .padding(horizontal = 10.dp, vertical = 4.dp)
+                                      ) {
+                                          Text(
+                                              text = tOpt.name,
+                                              color = if (isCurrentT) Color.White else KhlTextGray,
+                                              fontSize = 11.sp,
+                                              fontWeight = if (isCurrentT) FontWeight.Bold else FontWeight.Normal
+                                          )
+                                      }
+                                  }
+                              }
+                          }
+
+                          // Фильтры для вкладки 0 (Матчи)
                           if (bottomTab == 0) {
                               Row(
-                                  modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
+                                  modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
                                   horizontalArrangement = Arrangement.spacedBy(8.dp)
                               ) {
                                   val totalPast = pageData?.totalPastCount ?: pastList.size
@@ -988,6 +1057,7 @@ jobs:
                               }
                           }
 
+                          // Фильтры для вкладки 1 (Таблица)
                           if (bottomTab == 1) {
                               val groups = pageData?.standingGroups ?: emptyList()
                               if (groups.size > 1) {
@@ -1012,6 +1082,7 @@ jobs:
                               }
                           }
 
+                          // Фильтры для вкладки 2 (Лидеры)
                           if (bottomTab == 2 && playerCategories.isNotEmpty()) {
                               Row(
                                   modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 4.dp),
@@ -1019,15 +1090,19 @@ jobs:
                               ) {
                                   for (idx in 0 until playerCategories.size) {
                                       val catName = playerCategories[idx]
-                                      val active = selectedPlayerCatIdx == idx
+                                      val count = pageData?.playersByCategory?.get(catName)?.size ?: 0
+                                      val active = selectedPlayerCatIdx == idx && playerSearchQuery.isBlank()
                                       Box(
                                           modifier = Modifier
                                               .clip(RoundedCornerShape(14.dp))
                                               .background(if (active) KhlIceBlue else KhlBgDark)
-                                              .clickable { selectedPlayerCatIdx = idx }
+                                              .clickable {
+                                                  playerSearchQuery = ""
+                                                  selectedPlayerCatIdx = idx
+                                              }
                                               .padding(horizontal = 12.dp, vertical = 5.dp)
                                       ) {
-                                          Text(catName, color = if (active) Color.White else KhlTextGray, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                          Text("$catName ($count)", color = if (active) Color.White else KhlTextGray, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                                       }
                                   }
                               }
@@ -1052,7 +1127,7 @@ jobs:
                               selected = bottomTab == 2,
                               onClick = { bottomTab = 2 },
                               icon = { Icon(Icons.Default.EmojiEvents, null) },
-                              label = { Text("Лидеры") }
+                              label = { Text("Лидеры (${playerCategories.size})") }
                           )
                           NavigationBarItem(
                               selected = bottomTab == 3,
@@ -1068,7 +1143,7 @@ jobs:
                           Column(modifier = Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
                               CircularProgressIndicator(color = KhlAccentRed)
                               Spacer(modifier = Modifier.height(12.dp))
-                              Text("Загрузка данных ФХМ...", color = KhlTextGray, fontSize = 12.sp)
+                              Text("Загрузка таблиц, матчей и всех номинаций лидеров...", color = KhlTextGray, fontSize = 12.sp)
                           }
                       } else {
                           val data = pageData
@@ -1104,9 +1179,10 @@ jobs:
                                   }
                                   2 -> {
                                       val catKey = playerCategories.getOrNull(selectedPlayerCatIdx) ?: ""
-                                      val playersList = data.playersByCategory[catKey] ?: emptyList()
+                                      val currentCatPlayers = data.playersByCategory[catKey] ?: emptyList()
                                       KhlPlayersScreen(
-                                          players = playersList,
+                                          categoryPlayers = currentCatPlayers,
+                                          allTournamentPlayers = data.allUniquePlayers,
                                           searchQuery = playerSearchQuery,
                                           onSearchChange = { playerSearchQuery = it },
                                           onPlayerClick = { selectedPlayer = it }
@@ -1435,35 +1511,37 @@ jobs:
 
           @Composable
           fun KhlPlayersScreen(
-              players: List<BestPlayerItem>,
+              categoryPlayers: List<BestPlayerItem>,
+              allTournamentPlayers: List<BestPlayerItem>,
               searchQuery: String,
               onSearchChange: (String) -> Unit,
               onPlayerClick: (BestPlayerItem) -> Unit
           ) {
-              val filteredPlayers = remember(players, searchQuery) {
+              // Если строка поиска пуста — показываем выбранную номинацию, а если вводится запрос — ищем по ВСЕМ номинациям сразу!
+              val displayedPlayers = remember(categoryPlayers, allTournamentPlayers, searchQuery) {
                   if (searchQuery.isBlank()) {
-                      players
+                      categoryPlayers
                   } else {
                       val q = searchQuery.trim()
-                      players.filter { p ->
+                      allTournamentPlayers.filter { p ->
                           p.fullName.contains(q, ignoreCase = true) ||
                               p.clubName.contains(q, ignoreCase = true) ||
                               p.number == q
-                      }
+                      }.distinctBy { it.id }
                   }
               }
 
               Column(modifier = Modifier.fillMaxSize()) {
                   SearchFieldBar(
                       query = searchQuery,
-                      placeholder = "Поиск игрока по фамилии, клубу или номеру...",
+                      placeholder = "Поиск по всем номинациям (ФИО, клуб, номер)...",
                       onQueryChange = onSearchChange
                   )
 
-                  if (filteredPlayers.isEmpty()) {
+                  if (displayedPlayers.isEmpty()) {
                       Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
                           Text(
-                              text = if (searchQuery.isNotBlank()) "По запросу «$searchQuery» игроки не найдены." else "В этой номинации пока нет данных.",
+                              text = if (searchQuery.isNotBlank()) "По запросу «$searchQuery» среди лидеров турнира совпадений нет." else "В этой номинации пока нет данных.",
                               color = KhlTextGray,
                               fontSize = 14.sp,
                               textAlign = TextAlign.Center
@@ -1476,7 +1554,7 @@ jobs:
                       contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
                       verticalArrangement = Arrangement.spacedBy(10.dp)
                   ) {
-                      items(filteredPlayers) { p ->
+                      items(displayedPlayers) { p ->
                           Card(
                               colors = CardDefaults.cardColors(containerColor = KhlCardDark),
                               shape = RoundedCornerShape(14.dp),
@@ -1819,11 +1897,11 @@ jobs:
             exit 1
           }
 
-      - name: Rename APK to v5.0
-        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/fhm-khl-v50.apk
+      - name: Rename APK to v5.1
+        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/fhm-khl-v51.apk
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fhm-khl-v50
-          path: app/build/outputs/apk/debug/fhm-khl-v50.apk
+          name: fhm-khl-v51
+          path: app/build/outputs/apk/debug/fhm-khl-v51.apk
