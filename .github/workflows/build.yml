@@ -1,4 +1,4 @@
-name: Build FHM v3.1 APK
+name: Build FHM v4.0 Turbo APK
 
 on:
   push:
@@ -25,7 +25,7 @@ jobs:
           unzip -q gradle-8.7-bin.zip -d /tmp
           echo "/tmp/gradle-8.7/bin" >> $GITHUB_PATH
 
-      - name: Generate v3.1 project
+      - name: Generate v4.0 project
         run: |
           rm -rf app settings.gradle.kts build.gradle.kts gradle.properties
           mkdir -p app/src/main/java/com/fhm/khlstyle
@@ -45,7 +45,7 @@ jobs:
                   mavenCentral()
               }
           }
-          rootProject.name = "FHM_KHL_V31"
+          rootProject.name = "FHM_KHL_V40"
           include(":app")
           EOF
 
@@ -77,8 +77,8 @@ jobs:
                   applicationId = "com.fhm.khlstyle"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 31
-                  versionName = "3.1"
+                  versionCode = 40
+                  versionName = "4.0"
               }
 
               buildTypes {
@@ -141,17 +141,9 @@ jobs:
           cat << 'EOF' > app/src/main/java/com/fhm/khlstyle/MainActivity.kt
           package com.fhm.khlstyle
 
-          import android.annotation.SuppressLint
-          import android.content.ClipData
-          import android.content.ClipboardManager
-          import android.content.Context
-          import android.graphics.Bitmap
+          import android.content.Intent
+          import android.net.Uri
           import android.os.Bundle
-          import android.os.Handler
-          import android.os.Looper
-          import android.webkit.WebView
-          import android.webkit.WebViewClient
-          import android.widget.Toast
           import androidx.activity.ComponentActivity
           import androidx.activity.compose.setContent
           import androidx.compose.foundation.background
@@ -164,11 +156,11 @@ jobs:
           import androidx.compose.foundation.shape.CircleShape
           import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.material.icons.Icons
-          import androidx.compose.material.icons.filled.Code
-          import androidx.compose.material.icons.filled.ContentCopy
+          import androidx.compose.material.icons.filled.Close
           import androidx.compose.material.icons.filled.EmojiEvents
           import androidx.compose.material.icons.filled.FormatListNumbered
-          import androidx.compose.material.icons.filled.Public
+          import androidx.compose.material.icons.filled.Groups
+          import androidx.compose.material.icons.filled.OpenInBrowser
           import androidx.compose.material.icons.filled.Refresh
           import androidx.compose.material.icons.filled.SportsHockey
           import androidx.compose.material.icons.filled.SwapHoriz
@@ -180,25 +172,28 @@ jobs:
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.layout.ContentScale
           import androidx.compose.ui.platform.LocalContext
-          import androidx.compose.ui.text.font.FontFamily
           import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.text.style.TextAlign
           import androidx.compose.ui.text.style.TextOverflow
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
-          import androidx.compose.ui.viewinterop.AndroidView
           import coil.compose.AsyncImage
           import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.async
+          import kotlinx.coroutines.awaitAll
+          import kotlinx.coroutines.coroutineScope
           import kotlinx.coroutines.launch
-          import kotlinx.coroutines.suspendCancellableCoroutine
           import kotlinx.coroutines.withContext
-          import kotlinx.coroutines.withTimeoutOrNull
           import org.json.JSONArray
           import org.json.JSONObject
-          import org.json.JSONTokener
+          import org.jsoup.Connection
           import org.jsoup.Jsoup
-          import org.jsoup.nodes.Document
-          import kotlin.coroutines.resume
+
+          // --- МОДЕЛИ ДАННЫХ ФХМ ---
+          data class FhmTournamentOption(
+              val id: Int,
+              val name: String
+          )
 
           data class HockeyMatch(
               val id: String,
@@ -212,6 +207,7 @@ jobs:
               val tourName: String,
               val statusBadge: String,
               val isFinished: Boolean,
+              val isLive: Boolean,
               val gameUrl: String
           )
 
@@ -230,10 +226,12 @@ jobs:
               val pucksMissed: Int,
               val pucksDiff: Int,
               val points: Int,
-              val tieBreakNote: String
+              val tieBreakNote: String,
+              val groupName: String
           )
 
           data class StandingGroup(
+              val groupId: Int,
               val groupName: String,
               val rows: List<StandingRow>
           )
@@ -248,16 +246,19 @@ jobs:
               val birthDate: String,
               val clubName: String,
               val clubLogo: String,
-              val photoUrl: String,
-              val categoryKey: String,
+              val playerPhoto: String,
               val categoryTitle: String,
-              val statSummary: String,
-              val mainValue: String,
-              val rawStatJson: String
+              val games: Int,
+              val goals: Int,
+              val assists: Int,
+              val points: Int,
+              val mainStatLabel: String,
+              val mainStatValue: String,
+              val playerUrl: String
           )
 
           data class TournamentPageData(
-              val url: String,
+              val tournamentId: Int,
               val tournamentTitle: String,
               val totalUpcomingCount: Int,
               val totalPastCount: Int,
@@ -265,400 +266,304 @@ jobs:
               val pastMatches: List<HockeyMatch>,
               val standingGroups: List<StandingGroup>,
               val playersByCategory: Map<String, List<BestPlayerItem>>,
-              val diagnosticReport: String
+              val availableTournaments: List<FhmTournamentOption>
           )
 
-          object FhmTournamentParser {
+          // --- ПРЯМОЙ TURBO-КЛИЕНТ FHMOSCOW.COM (БЕЗ WEBVIEW!) ---
+          object FhmDirectApiClient {
+              private const val BASE_URL = "https://fhmoscow.com"
+              private const val USER_AGENT =
+                  "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
-              suspend fun loadTournament(context: Context, tournamentId: String): TournamentPageData {
-                  val targetUrl = "https://fhmoscow.com/tournament/$tournamentId?tournament-tab=2"
-                  val webResult = fetchDirectApiBatchViaWebView(context, targetUrl, tournamentId)
-                  val renderedHtml = webResult.first
-                  val apiPayloads = webResult.second
-
-                  val doc = if (renderedHtml.isNotEmpty()) Jsoup.parse(renderedHtml, targetUrl) else Document(targetUrl)
-                  return buildTournamentData(doc, targetUrl, apiPayloads)
-              }
-
-              @SuppressLint("SetJavaScriptEnabled")
-              private suspend fun fetchDirectApiBatchViaWebView(
-                  context: Context,
-                  url: String,
-                  tournamentId: String
-              ): Pair<String, List<Triple<String, String, String>>> {
-                  return withContext(Dispatchers.Main) {
-                      val result: Pair<String, List<Triple<String, String, String>>>? =
-                          withTimeoutOrNull<Pair<String, List<Triple<String, String, String>>> >(25000L) {
-                              suspendCancellableCoroutine<Pair<String, List<Triple<String, String, String>>>> { cont ->
-                                  val webView = WebView(context)
-                                  webView.layout(0, 0, 1080, 2400)
-                                  webView.settings.javaScriptEnabled = true
-                                  webView.settings.domStorageEnabled = true
-                                  webView.settings.userAgentString =
-                                      "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-
-                                  var finished = false
-                                  val mainHandler = Handler(Looper.getMainLooper())
-
-                                  val hooksJs = "(function() {" +
-                                      "window.__fhmPayloads = window.__fhmPayloads || [];" +
-                                      "if (!window.__fhmHookedV31) {" +
-                                      "  window.__fhmHookedV31 = true;" +
-                                      "  var origFetch = window.fetch;" +
-                                      "  if (origFetch) {" +
-                                      "    window.fetch = function() {" +
-                                      "      var u = arguments[0];" +
-                                      "      var opts = arguments[1] || {};" +
-                                      "      var reqB = (opts && opts.body) ? String(opts.body) : '';" +
-                                      "      var uStr = (typeof u === 'string') ? u : (u && u.url ? u.url : 'fetch');" +
-                                      "      return origFetch.apply(this, arguments).then(function(resp) {" +
-                                      "        try { resp.clone().text().then(function(txt) { window.__fhmPayloads.push({ url: uStr, req: reqB, body: txt.substring(0, 95000) }); }); } catch(e) {}" +
-                                      "        return resp;" +
-                                      "      });" +
-                                      "    };" +
-                                      "  }" +
-                                      "  var origOpen = XMLHttpRequest.prototype.open;" +
-                                      "  XMLHttpRequest.prototype.open = function(m, u) { this._url = u; return origOpen.apply(this, arguments); };" +
-                                      "  var origSend = XMLHttpRequest.prototype.send;" +
-                                      "  XMLHttpRequest.prototype.send = function(data) {" +
-                                      "    var self = this;" +
-                                      "    var reqB = data ? String(data) : '';" +
-                                      "    this.addEventListener('load', function() {" +
-                                      "      try { window.__fhmPayloads.push({ url: (self._url || 'xhr'), req: reqB, body: (self.responseText || '').substring(0, 95000) }); } catch(e) {}" +
-                                      "    });" +
-                                      "    return origSend.apply(this, arguments);" +
-                                      "  };" +
-                                      "}" +
-                                      "})();"
-
-                                  // Выполняем прямые POST-запросы к открытому нами API fhmoscow.com прямо из контекста страницы:
-                                  // 1) Все прошедшие матчи (limit: 100, period: "-")
-                                  // 2) Все будущие матчи (limit: 100, period: "+")
-                                  // 3) Все группы таблиц (из атрибутов data-standings-group)
-                                  // 4) Все номинации лучших игроков (/api/playerStatistic/list с limit: 15)
-                                  val directApiBatchJs = "(function() {" +
-                                      "try {" +
-                                      "  var tid = parseInt('$tournamentId', 10) || 54;" +
-                                      "  var postJson = function(endpoint, payloadObj) {" +
-                                      "    var bodyStr = JSON.stringify(payloadObj);" +
-                                      "    fetch(endpoint, {" +
-                                      "      method: 'POST'," +
-                                      "      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' }," +
-                                      "      body: bodyStr" +
-                                      "    });" +
-                                      "  };" +
-                                      "  postJson('/api/game/list', { dateFrom: null, dateTo: null, limit: 100, offset: 0, hideTournament: null, period: '-', tournament: tid });" +
-                                      "  postJson('/api/game/list', { dateFrom: null, dateTo: null, limit: 100, offset: 0, hideTournament: null, period: '+', tournament: tid });" +
-                                      "  var groups = document.querySelectorAll('details.standings-group');" +
-                                      "  for (var i = 0; i < groups.length; i++) {" +
-                                      "    var gid = parseInt(groups[i].getAttribute('data-standings-group'), 10);" +
-                                      "    if (gid) { postJson('/api/tournamentTable/list', { tournament: tid, group: gid }); }" +
-                                      "  }" +
-                                      "  postJson('/api/playerStatistic/list', { season: null, tournament: tid, group: null, limit: 15, nomination: 'bomber', role: null });" +
-                                      "  postJson('/api/playerStatistic/list', { season: null, tournament: tid, group: null, limit: 15, nomination: 'sniper', role: null });" +
-                                      "  postJson('/api/playerStatistic/list', { season: null, tournament: tid, group: null, limit: 15, nomination: 'bomber', role: 2 });" +
-                                      "  postJson('/api/playerStatistic/list', { season: null, tournament: tid, group: null, limit: 15, nomination: 'sniper', role: 2 });" +
-                                      "  postJson('/api/playerStatistic/list', { season: null, tournament: tid, group: null, limit: 15, nomination: 'assistant', role: null });" +
-                                      "  postJson('/api/playerStatistic/list', { season: null, tournament: tid, group: null, limit: 15, nomination: 'penalty', role: null });" +
-                                      "  postJson('/api/playerStatistic/list', { season: null, tournament: tid, group: null, limit: 15, nomination: 'goalkeeper', role: null });" +
-                                      "} catch(e) {}" +
-                                      "})();"
-
-                                  val dumpJs = "(function() {" +
-                                      "return JSON.stringify({" +
-                                      "  html: document.documentElement.outerHTML," +
-                                      "  payloads: window.__fhmPayloads || []" +
-                                      "});" +
-                                      "})();"
-
-                                  webView.webViewClient = object : WebViewClient() {
-                                      override fun onPageStarted(view: WebView?, loadedUrl: String?, favicon: Bitmap?) {
-                                          super.onPageStarted(view, loadedUrl, favicon)
-                                          view?.evaluateJavascript(hooksJs, null)
-                                      }
-
-                                      override fun onPageFinished(view: WebView?, loadedUrl: String?) {
-                                          if (finished) return
-                                          webView.evaluateJavascript(hooksJs, null)
-
-                                          // Через 0.8 сек запускаем пакетный запрос ко всем API эндпоинтам ФХМ
-                                          mainHandler.postDelayed({
-                                              if (!finished && cont.isActive) {
-                                                  webView.evaluateJavascript(directApiBatchJs, null)
-                                              }
-                                          }, 800L)
-
-                                          // Через 3.8 сек забираем все ответы
-                                          mainHandler.postDelayed({
-                                              if (!finished && cont.isActive) {
-                                                  finished = true
-                                                  webView.evaluateJavascript(dumpJs) { rawJson ->
-                                                      var htmlOut = ""
-                                                      val payloadsList = mutableListOf<Triple<String, String, String>>()
-                                                      try {
-                                                          if (rawJson != null && rawJson != "null") {
-                                                              val unquoted = JSONTokener(rawJson).nextValue()?.toString() ?: ""
-                                                              val obj = JSONObject(unquoted)
-                                                              htmlOut = obj.optString("html", "")
-                                                              val arr = obj.optJSONArray("payloads") ?: JSONArray()
-                                                              for (i in 0 until arr.length()) {
-                                                                  val item = arr.optJSONObject(i)
-                                                                  if (item != null) {
-                                                                      payloadsList.add(
-                                                                          Triple(
-                                                                              item.optString("url", ""),
-                                                                              item.optString("req", ""),
-                                                                              item.optString("body", "")
-                                                                          )
-                                                                      )
-                                                                  }
-                                                              }
-                                                          }
-                                                      } catch (e: Exception) {
-                                                          htmlOut = ""
-                                                      }
-                                                      webView.destroy()
-                                                      if (cont.isActive) {
-                                                          cont.resume(Pair(htmlOut, payloadsList))
-                                                      }
-                                                  }
-                                              }
-                                          }, 3800L)
-                                      }
-                                  }
-
-                                  cont.invokeOnCancellation {
-                                      mainHandler.removeCallbacksAndMessages(null)
-                                      webView.stopLoading()
-                                      webView.destroy()
-                                  }
-
-                                  webView.loadUrl(url)
-                              }
-                          }
-                      result ?: Pair("", emptyList())
+              private fun postApiJson(endpoint: String, payload: JSONObject, referer: String): String {
+                  return try {
+                      Jsoup.connect("$BASE_URL$endpoint")
+                          .userAgent(USER_AGENT)
+                          .header("Content-Type", "application/json")
+                          .header("Accept", "application/json, text/plain, */*")
+                          .header("X-Requested-With", "XMLHttpRequest")
+                          .referrer(referer)
+                          .ignoreContentType(true)
+                          .maxBodySize(0)
+                          .timeout(10000)
+                          .method(Connection.Method.POST)
+                          .requestBody(payload.toString())
+                          .execute()
+                          .body()
+                  } catch (e: Exception) {
+                      ""
                   }
               }
 
-              private fun buildTournamentData(
-                  doc: Document,
-                  url: String,
-                  apiPayloads: List<Triple<String, String, String>>
-              ): TournamentPageData {
-                  val h1 = doc.select("h1, h2").firstOrNull()?.text()?.trim() ?: "Кубок г. Москвы"
-                  val upcomingMatches = mutableListOf<HockeyMatch>()
-                  val pastMatches = mutableListOf<HockeyMatch>()
-                  var totalUpcoming = 0
-                  var totalPast = 0
+              suspend fun loadFullTournament(tournamentId: Int): TournamentPageData = withContext(Dispatchers.IO) {
+                  val pageUrl = "$BASE_URL/tournament/$tournamentId"
 
-                  val groupNamesById = mutableMapOf<String, String>()
-                  val detailsEls = doc.select("details.standings-group")
-                  for (dEl in detailsEls) {
-                      val gid = dEl.attr("data-standings-group")
-                      val gName = dEl.select("summary span").firstOrNull()?.text()?.trim() ?: "Группа"
-                      if (gid.isNotEmpty()) groupNamesById[gid] = gName
+                  // 1. Быстрым GET-запросом (0.2 сек) берем название турнира и ID групп из тегов <details data-standings-group="...">
+                  val doc = try {
+                      Jsoup.connect(pageUrl)
+                          .userAgent(USER_AGENT)
+                          .timeout(8000)
+                          .get()
+                  } catch (e: Exception) {
+                      null
                   }
 
-                  val parsedStandingGroups = mutableListOf<StandingGroup>()
-                  val playersMap = linkedMapOf<String, MutableList<BestPlayerItem>>(
-                      "Бомбардиры" to mutableListOf(),
-                      "Снайперы" to mutableListOf(),
-                      "Защитники-бомбардиры" to mutableListOf(),
-                      "Защитники-снайперы" to mutableListOf(),
-                      "Штрафники" to mutableListOf(),
-                      "Ассистенты" to mutableListOf(),
-                      "Вратари" to mutableListOf()
-                  )
-
-                  val samplePlayerStatJson = StringBuilder()
-
-                  for (payload in apiPayloads) {
-                      val apiUrl = payload.first
-                      val reqBody = payload.second
-                      val body = payload.third.trim()
-                      if (!body.startsWith("{")) continue
-
-                      try {
-                          // 1. Матчи (/api/game/list)
-                          if (apiUrl.contains("/api/game/list")) {
-                              val json = JSONObject(body)
-                              val count = json.optInt("count", 0)
-                              val items = json.optJSONArray("items")
-                              if (items != null) {
-                                  for (i in 0 until items.length()) {
-                                      val mObj = items.optJSONObject(i) ?: continue
-                                      val match = parseGameJsonItem(mObj, i)
-                                      if (match.isFinished) {
-                                          if (count > totalPast) totalPast = count
-                                          if (pastMatches.none { it.id == match.id }) pastMatches.add(match)
-                                      } else {
-                                          if (count > totalUpcoming) totalUpcoming = count
-                                          if (upcomingMatches.none { it.id == match.id }) upcomingMatches.add(match)
-                                      }
-                                  }
-                              }
+                  val h1 = doc?.select("h1, h2")?.firstOrNull()?.text()?.trim() ?: "Турнир ФХМ #$tournamentId"
+                  val groupDefs = mutableListOf<Pair<Int, String>>()
+                  if (doc != null) {
+                      val detailsEls = doc.select("details.standings-group")
+                      for (dEl in detailsEls) {
+                          val gid = dEl.attr("data-standings-group").toIntOrNull()
+                          val gName = dEl.select("summary span").firstOrNull()?.text()?.trim() ?: "Группа"
+                          if (gid != null) {
+                              groupDefs.add(Pair(gid, gName))
                           }
-
-                          // 2. Таблицы (/api/tournamentTable/list)
-                          if (apiUrl.contains("/api/tournamentTable/list")) {
-                              val json = JSONObject(body)
-                              val items = json.optJSONArray("items")
-                              if (items != null && items.length() > 0) {
-                                  val rows = mutableListOf<StandingRow>()
-                                  for (i in 0 until items.length()) {
-                                      val rObj = items.optJSONObject(i) ?: continue
-                                      rows.add(
-                                          StandingRow(
-                                              position = rObj.optInt("position", i + 1),
-                                              teamId = rObj.optInt("teamId", 0),
-                                              teamName = rObj.optString("team", "Команда"),
-                                              logoUrl = rObj.optString("logo", ""),
-                                              games = rObj.optInt("games", 0),
-                                              wins = rObj.optInt("countWin", 0),
-                                              ties = rObj.optInt("countTie", 0),
-                                              losses = rObj.optInt("countLose", 0),
-                                              otWins = rObj.optInt("countOvertimeWin", 0),
-                                              otLosses = rObj.optInt("countOvertimeLose", 0),
-                                              pucksScored = rObj.optInt("pucksScored", 0),
-                                              pucksMissed = rObj.optInt("pucksMissed", 0),
-                                              pucksDiff = rObj.optInt("pucksDifference", 0),
-                                              points = rObj.optInt("score", 0),
-                                              tieBreakNote = rObj.optString("tieBreakRuleLabel", "")
-                                          )
-                                      )
-                                  }
-
-                                  val matchedGroupTitle = detectGroupName(reqBody, rows.size, groupNamesById, parsedStandingGroups.size)
-                                  val firstTeamId = rows.firstOrNull()?.teamId ?: 0
-                                  if (parsedStandingGroups.none { it.rows.firstOrNull()?.teamId == firstTeamId }) {
-                                      parsedStandingGroups.add(StandingGroup(groupName = matchedGroupTitle, rows = rows))
-                                  }
-                              }
-                          }
-
-                          // 3. Статистика игроков (/api/playerStatistic/list)
-                          if (apiUrl.contains("/api/playerStatistic/list")) {
-                              val json = JSONObject(body)
-                              val items = json.optJSONArray("items")
-                              if (items != null && items.length() > 0) {
-                                  val reqJson = try { JSONObject(reqBody) } catch (e: Exception) { JSONObject() }
-                                  val nom = reqJson.optString("nomination", "")
-                                  val roleVal = if (reqJson.isNull("role")) 0 else reqJson.optInt("role", 0)
-
-                                  val categoryTitle = when {
-                                      nom == "bomber" && roleVal == 2 -> "Защитники-бомбардиры"
-                                      nom == "sniper" && roleVal == 2 -> "Защитники-снайперы"
-                                      nom == "bomber" -> "Бомбардиры"
-                                      nom == "sniper" -> "Снайперы"
-                                      nom == "penalty" -> "Штрафники"
-                                      nom == "assistant" -> "Ассистенты"
-                                      nom == "goalkeeper" -> "Вратари"
-                                      else -> "Бомбардиры"
-                                  }
-
-                                  val targetList = playersMap.getOrPut(categoryTitle) { mutableListOf() }
-
-                                  for (i in 0 until items.length()) {
-                                      val pObj = items.optJSONObject(i) ?: continue
-                                      if (samplePlayerStatJson.length < 2500) {
-                                          samplePlayerStatJson.append("[").append(categoryTitle).append("]: ").append(pObj.toString()).append("\n\n")
-                                      }
-                                      val parsedPlayer = parsePlayerStatItem(pObj, i + 1, categoryTitle)
-                                      if (targetList.none { it.id == parsedPlayer.id }) {
-                                          targetList.add(parsedPlayer)
-                                      }
-                                  }
-                              }
-                          }
-                      } catch (e: Exception) {
-                          // ignore
                       }
                   }
 
-                  parsedStandingGroups.sortBy {
-                      when {
-                          it.groupName.contains("Группа А") -> 1
-                          it.groupName.contains("Группа Б") -> 2
-                          it.groupName.contains("Группа В") -> 3
-                          else -> 4
+                  // Получаем список всех доступных турниров с главной/фильтров
+                  val tournamentsList = mutableListOf<FhmTournamentOption>()
+                  if (doc != null) {
+                      val tLinks = doc.select("a[href*=/tournament/]")
+                      for (a in tLinks) {
+                          val href = a.attr("href")
+                          val tid = href.substringAfter("/tournament/").substringBefore("?").filter { it.isDigit() }.toIntOrNull()
+                          val tName = a.text().trim()
+                          if (tid != null && tName.length > 4 && tournamentsList.none { it.id == tid }) {
+                              tournamentsList.add(FhmTournamentOption(tid, tName))
+                          }
                       }
                   }
 
-                  // Оставляем только непустые категории игроков
-                  val nonEmptyPlayersMap = playersMap.filterValues { it.isNotEmpty() }
-
-                  val report = buildString {
-                      appendLine("=== ОТЧЕТ ПАРСЕРА v3.1 (FULL JSON API) ===")
-                      appendLine("Турнир: $h1")
-                      appendLine("Матчей загружено: ${pastMatches.size} прошедших (всего $totalPast), ${upcomingMatches.size} будущих (всего $totalUpcoming)")
-                      appendLine("Групп таблицы: ${parsedStandingGroups.size}")
-                      appendLine("Категорий игроков: ${nonEmptyPlayersMap.size}")
-                      nonEmptyPlayersMap.forEach { (cat, list) ->
-                          appendLine(" • $cat: ${list.size} чел. (Лидер: ${list.firstOrNull()?.shortName} — ${list.firstOrNull()?.mainValue})")
+                  // 2. ПАРАЛЛЕЛЬНО запрашиваем:
+                  // - 3 страницы прошедших матчей (offset = 0, 8, 16 -> 24 матча)
+                  // - 3 страницы будущих матчей (offset = 0, 8, 16 -> 24 матча)
+                  // - Все группы таблиц
+                  // - Все 6 номинаций игроков
+                  coroutineScope {
+                      val pastJobs = listOf(0, 8, 16).map { offset ->
+                          async { fetchGamesPage(tournamentId, "-", offset, pageUrl) }
                       }
-                      appendLine("\n=== ПОЛНЫЙ JSON ИГРОКОВ (/api/playerStatistic/list) ===")
-                      appendLine(samplePlayerStatJson.toString())
-                  }
+                      val upcomingJobs = listOf(0, 8, 16).map { offset ->
+                          async { fetchGamesPage(tournamentId, "+", offset, pageUrl) }
+                      }
 
-                  return TournamentPageData(
-                      url = url,
-                      tournamentTitle = h1,
-                      totalUpcomingCount = if (totalUpcoming > upcomingMatches.size) totalUpcoming else upcomingMatches.size,
-                      totalPastCount = if (totalPast > pastMatches.size) totalPast else pastMatches.size,
-                      upcomingMatches = upcomingMatches,
-                      pastMatches = pastMatches,
-                      standingGroups = parsedStandingGroups,
-                      playersByCategory = nonEmptyPlayersMap,
-                      diagnosticReport = report
-                  )
+                      val tableJobs = if (groupDefs.isNotEmpty()) {
+                          groupDefs.map { (gid, gName) ->
+                              async { fetchStandingGroup(tournamentId, gid, gName, pageUrl) }
+                          }
+                      } else {
+                          // Если турнир без деления на группы, пробуем group = null
+                          listOf(async { fetchStandingGroup(tournamentId, null, "Общая таблица", pageUrl) })
+                      }
+
+                      val playerCategoriesSpec = listOf(
+                          Triple("Бомбардиры", "bomber", null),
+                          Triple("Снайперы", "sniper", null),
+                          Triple("Ассистенты", "assistant", null),
+                          Triple("Защитники-бомбардиры", "bomber", 2),
+                          Triple("Защитники-снайперы", "sniper", 2),
+                          Triple("Штрафники", "penalty", null),
+                          Triple("Вратари", "goalkeeper", null)
+                      )
+
+                      val playerJobs = playerCategoriesSpec.map { (title, nom, role) ->
+                          async { Pair(title, fetchPlayersCategory(tournamentId, title, nom, role, pageUrl)) }
+                      }
+
+                      val pastResults = pastJobs.awaitAll()
+                      val upcomingResults = upcomingJobs.awaitAll()
+                      val standingGroups = tableJobs.awaitAll().filter { it.rows.isNotEmpty() }
+                      val playerResults = playerJobs.awaitAll()
+
+                      val totalPast = pastResults.maxOfOrNull { it.first } ?: 0
+                      val totalUpcoming = upcomingResults.maxOfOrNull { it.first } ?: 0
+
+                      val mergedPast = pastResults.flatMap { it.second }.distinctBy { it.id }
+                      val mergedUpcoming = upcomingResults.flatMap { it.second }.distinctBy { it.id }
+
+                      val playersMap = linkedMapOf<String, List<BestPlayerItem>>()
+                      for ((title, list) in playerResults) {
+                          if (list.isNotEmpty()) {
+                              playersMap[title] = list
+                          }
+                      }
+
+                      TournamentPageData(
+                          tournamentId = tournamentId,
+                          tournamentTitle = h1,
+                          totalUpcomingCount = maxOf(totalUpcoming, mergedUpcoming.size),
+                          totalPastCount = maxOf(totalPast, mergedPast.size),
+                          upcomingMatches = mergedUpcoming,
+                          pastMatches = mergedPast,
+                          standingGroups = standingGroups,
+                          playersByCategory = playersMap,
+                          availableTournaments = tournamentsList
+                      )
+                  }
+              }
+
+              // Догрузка следующих 24 матчей (по 3 страницы за раз) при нажатии кнопки "Показать еще"
+              suspend fun loadMoreMatches(
+                  tournamentId: Int,
+                  period: String,
+                  currentOffset: Int
+              ): List<HockeyMatch> = withContext(Dispatchers.IO) {
+                  val pageUrl = "$BASE_URL/tournament/$tournamentId"
+                  coroutineScope {
+                      val offsets = listOf(currentOffset, currentOffset + 8, currentOffset + 16)
+                      val jobs = offsets.map { off ->
+                          async { fetchGamesPage(tournamentId, period, off, pageUrl).second }
+                      }
+                      jobs.awaitAll().flatten().distinctBy { it.id }
+                  }
+              }
+
+              private fun fetchGamesPage(
+                  tournamentId: Int,
+                  period: String,
+                  offset: Int,
+                  referer: String
+              ): Pair<Int, List<HockeyMatch>> {
+                  val req = JSONObject().apply {
+                      put("dateFrom", JSONObject.NULL)
+                      put("dateTo", JSONObject.NULL)
+                      put("limit", 8)
+                      put("offset", offset)
+                      put("hideTournament", JSONObject.NULL)
+                      put("period", period)
+                      put("tournament", tournamentId)
+                  }
+                  val body = postApiJson("/api/game/list", req, referer)
+                  if (!body.startsWith("{")) return Pair(0, emptyList())
+
+                  return try {
+                      val json = JSONObject(body)
+                      val count = json.optInt("count", 0)
+                      val items = json.optJSONArray("items") ?: JSONArray()
+                      val list = mutableListOf<HockeyMatch>()
+                      for (i in 0 until items.length()) {
+                          val mObj = items.optJSONObject(i) ?: continue
+                          list.add(parseGameJsonItem(mObj, offset + i))
+                      }
+                      Pair(count, list)
+                  } catch (e: Exception) {
+                      Pair(0, emptyList())
+                  }
+              }
+
+              private fun fetchStandingGroup(
+                  tournamentId: Int,
+                  groupId: Int?,
+                  groupName: String,
+                  referer: String
+              ): StandingGroup {
+                  val req = JSONObject().apply {
+                      put("tournament", tournamentId)
+                      if (groupId != null) put("group", groupId) else put("group", JSONObject.NULL)
+                  }
+                  val body = postApiJson("/api/tournamentTable/list", req, referer)
+                  if (!body.startsWith("{")) return StandingGroup(groupId ?: 0, groupName, emptyList())
+
+                  return try {
+                      val json = JSONObject(body)
+                      val items = json.optJSONArray("items") ?: JSONArray()
+                      val rows = mutableListOf<StandingRow>()
+                      for (i in 0 until items.length()) {
+                          val rObj = items.optJSONObject(i) ?: continue
+                          rows.add(
+                              StandingRow(
+                                  position = rObj.optInt("position", i + 1),
+                                  teamId = rObj.optInt("teamId", 0),
+                                  teamName = rObj.optString("team", "Команда"),
+                                  logoUrl = rObj.optString("logo", ""),
+                                  games = rObj.optInt("games", 0),
+                                  wins = rObj.optInt("countWin", 0),
+                                  ties = rObj.optInt("countTie", 0),
+                                  losses = rObj.optInt("countLose", 0),
+                                  otWins = rObj.optInt("countOvertimeWin", 0),
+                                  otLosses = rObj.optInt("countOvertimeLose", 0),
+                                  pucksScored = rObj.optInt("pucksScored", 0),
+                                  pucksMissed = rObj.optInt("pucksMissed", 0),
+                                  pucksDiff = rObj.optInt("pucksDifference", 0),
+                                  points = rObj.optInt("score", 0),
+                                  tieBreakNote = rObj.optString("tieBreakRuleLabel", ""),
+                                  groupName = groupName
+                              )
+                          )
+                      }
+                      StandingGroup(groupId ?: 0, groupName, rows)
+                  } catch (e: Exception) {
+                      StandingGroup(groupId ?: 0, groupName, emptyList())
+                  }
+              }
+
+              private fun fetchPlayersCategory(
+                  tournamentId: Int,
+                  categoryTitle: String,
+                  nomination: String,
+                  role: Int?,
+                  referer: String
+              ): List<BestPlayerItem> {
+                  val req = JSONObject().apply {
+                      put("season", JSONObject.NULL)
+                      put("tournament", tournamentId)
+                      put("group", JSONObject.NULL)
+                      put("limit", 25)
+                      put("nomination", nomination)
+                      if (role != null) put("role", role) else put("role", JSONObject.NULL)
+                  }
+                  val body = postApiJson("/api/playerStatistic/list", req, referer)
+                  if (!body.startsWith("{")) return emptyList()
+
+                  return try {
+                      val json = JSONObject(body)
+                      val items = json.optJSONArray("items") ?: JSONArray()
+                      val list = mutableListOf<BestPlayerItem>()
+                      for (i in 0 until items.length()) {
+                          val pObj = items.optJSONObject(i) ?: continue
+                          list.add(parsePlayerStatItem(pObj, i + 1, categoryTitle, nomination))
+                      }
+                      list
+                  } catch (e: Exception) {
+                      emptyList()
+                  }
               }
 
               private fun parsePlayerStatItem(
                   pObj: JSONObject,
                   rank: Int,
-                  categoryTitle: String
+                  categoryTitle: String,
+                  nomination: String
               ): BestPlayerItem {
                   val id = pObj.optString("id", "p_$rank")
-                  val surname = pObj.optString("surname", "")
-                  val name = pObj.optString("name", "")
-                  val patronymic = pObj.optString("patronymic", "")
+                  val surname = pObj.optString("surname", "").trim()
+                  val name = pObj.optString("name", "").trim()
+                  val patronymic = pObj.optString("patronymic", "").trim()
                   val fullName = "$surname $name $patronymic".trim()
                   val shortName = "$surname $name".trim()
 
-                  val number = if (!pObj.isNull("number")) pObj.optString("number", "") else ""
+                  val numberInt = pObj.optInt("number", 0)
+                  val numberStr = if (numberInt > 0) numberInt.toString() else ""
                   val roleName = pObj.optString("role", "")
                   val birthDate = pObj.optString("dateOfBirth", "")
                   val clubName = pObj.optString("clubName", "")
                   val clubLogo = pObj.optString("clubPhoto", "")
-                  val photoUrl = if (!pObj.isNull("photo")) pObj.optString("photo", "") else ""
+                  val photoRaw = if (!pObj.isNull("photo")) pObj.optString("photo", "") else ""
+                  val playerUrl = "$BASE_URL${pObj.optString("url", "/player/$id")}"
 
-                  val statObj = pObj.optJSONObject("statistics")
-                  var mainVal = ""
-                  val summaryParts = mutableListOf<String>()
+                  val statObj = pObj.optJSONObject("statistics") ?: JSONObject()
+                  val games = statObj.optInt("games", 0)
+                  val goals = statObj.optInt("goals", 0)
+                  val assists = statObj.optInt("assists", 0)
+                  val points = statObj.optInt("goalPasses", goals + assists)
+                  val penalty = statObj.optInt("penalty", statObj.optInt("penaltyMinutes", 0))
 
-                  if (statObj != null) {
-                      val keys = statObj.keys()
-                      while (keys.hasNext()) {
-                          val k = keys.next()
-                          val v = statObj.opt(k)
-                          if (v != null && v.toString() != "null" && k != "nomination") {
-                              val label = when (k.lowercase()) {
-                                  "games", "game", "countgames" -> "И"
-                                  "goals", "goal", "pucks", "scored" -> "Г"
-                                  "assists", "assist", "passes" -> "П"
-                                  "points", "point", "score", "total", "value" -> "О"
-                                  "penalty", "penaltyminutes", "pim" -> "Штр"
-                                  else -> k
-                              }
-                              summaryParts.add("$label: $v")
-                              if (k.equals("value", true) || k.equals("score", true) || k.equals("points", true) || k.equals("goals", true) || k.equals("penalty", true)) {
-                                  mainVal = v.toString()
-                              }
-                          }
-                      }
-                      if (mainVal.isEmpty() && summaryParts.isNotEmpty()) {
-                          mainVal = summaryParts.last().substringAfter(": ")
-                      }
+                  val (mainLabel, mainVal) = when (nomination) {
+                      "sniper" -> Pair("ШАЙБЫ", goals.toString())
+                      "assistant" -> Pair("ПАСЫ", assists.toString())
+                      "penalty" -> Pair("ШТРАФ", penalty.toString())
+                      else -> Pair("ОЧКИ", points.toString())
                   }
 
                   return BestPlayerItem(
@@ -666,35 +571,21 @@ jobs:
                       rank = rank,
                       fullName = fullName,
                       shortName = shortName,
-                      number = number,
+                      number = numberStr,
                       roleName = roleName,
                       birthDate = birthDate,
                       clubName = clubName,
                       clubLogo = clubLogo,
-                      photoUrl = photoUrl.ifEmpty { clubLogo },
-                      categoryKey = categoryTitle,
+                      playerPhoto = photoRaw.ifEmpty { clubLogo },
                       categoryTitle = categoryTitle,
-                      statSummary = summaryParts.joinToString("  •  "),
-                      mainValue = mainVal,
-                      rawStatJson = statObj?.toString() ?: "{}"
+                      games = games,
+                      goals = goals,
+                      assists = assists,
+                      points = points,
+                      mainStatLabel = mainLabel,
+                      mainStatValue = mainVal,
+                      playerUrl = playerUrl
                   )
-              }
-
-              private fun detectGroupName(
-                  reqBody: String,
-                  teamCount: Int,
-                  groupNamesById: Map<String, String>,
-                  currentIdx: Int
-              ): String {
-                  for (entry in groupNamesById.entries) {
-                      if (reqBody.contains(entry.key)) return entry.value
-                  }
-                  return when (teamCount) {
-                      12 -> "Группа А"
-                      15 -> "Группа Б"
-                      17 -> "Группа В"
-                      else -> "Группа #${currentIdx + 1}"
-                  }
               }
 
               private fun parseGameJsonItem(mObj: JSONObject, index: Int): HockeyMatch {
@@ -744,7 +635,8 @@ jobs:
                       tourName = tourStr,
                       statusBadge = statusBadge,
                       isFinished = (statusInt == 2),
-                      gameUrl = "https://fhmoscow.com$gameUrl"
+                      isLive = isLive,
+                      gameUrl = "$BASE_URL$gameUrl"
                   )
               }
           }
@@ -768,26 +660,31 @@ jobs:
                               secondary = KhlIceBlue
                           )
                       ) {
-                          FhmKhlAppV31()
+                          FhmKhlAppV40()
                       }
                   }
               }
           }
 
           @Composable
-          fun FhmKhlAppV31() {
+          fun FhmKhlAppV40() {
               val context = LocalContext.current
               val scope = rememberCoroutineScope()
 
-              var bottomTab by remember { mutableIntStateOf(0) }
-              var matchFilter by remember { mutableIntStateOf(1) }
+              var bottomTab by remember { mutableIntStateOf(0) } // 0=Матчи, 1=Таблица, 2=Игроки, 3=Клубы
+              var matchFilter by remember { mutableIntStateOf(1) } // 1=Прошедшие, 0=Ближайшие
               var selectedMatchGroup by remember { mutableStateOf("Все") }
+              var selectedTeamFilter by remember { mutableStateOf<String?>(null) }
               var selectedTableGroupIdx by remember { mutableIntStateOf(0) }
               var selectedPlayerCatIdx by remember { mutableIntStateOf(0) }
-              var tournamentId by remember { mutableStateOf("54") }
+              var tournamentId by remember { mutableIntStateOf(54) }
 
               var pageData by remember { mutableStateOf<TournamentPageData?>(null) }
+              var pastList by remember { mutableStateOf<List<HockeyMatch>>(emptyList()) }
+              var upcomingList by remember { mutableStateOf<List<HockeyMatch>>(emptyList()) }
               var isLoading by remember { mutableStateOf(true) }
+              var isLoadingMore by remember { mutableStateOf(false) }
+
               var selectedMatch by remember { mutableStateOf<HockeyMatch?>(null) }
               var selectedTeamRow by remember { mutableStateOf<StandingRow?>(null) }
               var selectedPlayer by remember { mutableStateOf<BestPlayerItem?>(null) }
@@ -798,15 +695,36 @@ jobs:
                       isLoading = true
                       selectedTableGroupIdx = 0
                       selectedPlayerCatIdx = 0
-                      pageData = FhmTournamentParser.loadTournament(context, tournamentId)
+                      selectedTeamFilter = null
+                      val data = FhmDirectApiClient.loadFullTournament(tournamentId)
+                      pageData = data
+                      pastList = data.pastMatches
+                      upcomingList = data.upcomingMatches
                       isLoading = false
+                  }
+              }
+
+              fun loadMoreCurrentMatches() {
+                  if (isLoadingMore) return
+                  scope.launch {
+                      isLoadingMore = true
+                      if (matchFilter == 1) {
+                          val more = FhmDirectApiClient.loadMoreMatches(tournamentId, "-", pastList.size)
+                          pastList = (pastList + more).distinctBy { it.id }
+                      } else {
+                          val more = FhmDirectApiClient.loadMoreMatches(tournamentId, "+", upcomingList.size)
+                          upcomingList = (upcomingList + more).distinctBy { it.id }
+                      }
+                      isLoadingMore = false
                   }
               }
 
               LaunchedEffect(tournamentId) { reload() }
 
-              val totalLoadedMatches = (pageData?.upcomingMatches?.size ?: 0) + (pageData?.pastMatches?.size ?: 0)
               val playerCategories = pageData?.playersByCategory?.keys?.toList() ?: emptyList()
+              val allClubs = remember(pageData) {
+                  pageData?.standingGroups?.flatMap { it.rows } ?: emptyList()
+              }
 
               Scaffold(
                   containerColor = KhlBgDark,
@@ -827,14 +745,14 @@ jobs:
                                       Box(modifier = Modifier.size(9.dp).clip(CircleShape).background(KhlAccentRed))
                                       Spacer(modifier = Modifier.width(8.dp))
                                       Text(
-                                          text = "ФХМ v3.1 • ТУРНИР #$tournamentId",
+                                          text = "ФХМ • МАТЧ-ЦЕНТР (ТУРНИР #$tournamentId)",
                                           color = KhlIceBlue,
                                           fontSize = 11.sp,
                                           fontWeight = FontWeight.Bold
                                       )
                                   }
                                   Text(
-                                      text = pageData?.tournamentTitle ?: "Загрузка турнира #$tournamentId...",
+                                      text = pageData?.tournamentTitle ?: "Загрузка...",
                                       color = Color.White,
                                       fontSize = 15.sp,
                                       fontWeight = FontWeight.Black,
@@ -844,7 +762,7 @@ jobs:
                               }
                               Row {
                                   IconButton(onClick = { showTournamentPicker = true }) {
-                                      Icon(Icons.Default.SwapHoriz, contentDescription = "Турниры", tint = KhlIceBlue)
+                                      Icon(Icons.Default.SwapHoriz, contentDescription = "Сменить турнир", tint = KhlIceBlue)
                                   }
                                   IconButton(onClick = { reload() }) {
                                       Icon(Icons.Default.Refresh, contentDescription = "Обновить", tint = Color.White)
@@ -852,15 +770,17 @@ jobs:
                               }
                           }
 
-                          // Шапка для вкладки Матчи
+                          // Шапка для вкладки 0 (Матчи)
                           if (bottomTab == 0) {
                               Row(
                                   modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
                                   horizontalArrangement = Arrangement.spacedBy(8.dp)
                               ) {
+                                  val totalPast = pageData?.totalPastCount ?: pastList.size
+                                  val totalUp = pageData?.totalUpcomingCount ?: upcomingList.size
                                   val filters = listOf(
-                                      1 to "Прошедшие (${pageData?.pastMatches?.size ?: 0})",
-                                      0 to "Ближайшие (${pageData?.upcomingMatches?.size ?: 0})"
+                                      1 to "Результаты (${pastList.size} из $totalPast)",
+                                      0 to "Календарь (${upcomingList.size} из $totalUp)"
                                   )
                                   filters.forEach { pair ->
                                       val idx = pair.first
@@ -878,27 +798,50 @@ jobs:
                                   }
                               }
 
-                              val groupOptions = listOf("Все", "Группа А", "Группа Б", "Группа В")
-                              Row(
-                                  modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 2.dp),
-                                  horizontalArrangement = Arrangement.spacedBy(6.dp)
-                              ) {
-                                  groupOptions.forEach { grp ->
-                                      val isSel = selectedMatchGroup == grp
-                                      Box(
-                                          modifier = Modifier
-                                              .clip(RoundedCornerShape(8.dp))
-                                              .background(if (isSel) KhlIceBlue.copy(alpha = 0.25f) else Color.Transparent)
-                                              .clickable { selectedMatchGroup = grp }
-                                              .padding(horizontal = 10.dp, vertical = 4.dp)
-                                      ) {
-                                          Text(grp, color = if (isSel) KhlIceBlue else KhlTextGray, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                              // Плашка выбранного клуба (если отфильтровано по команде)
+                              if (selectedTeamFilter != null) {
+                                  Row(
+                                      modifier = Modifier
+                                          .fillMaxWidth()
+                                          .padding(horizontal = 12.dp, vertical = 4.dp)
+                                          .clip(RoundedCornerShape(8.dp))
+                                          .background(KhlIceBlue.copy(alpha = 0.2f))
+                                          .clickable { selectedTeamFilter = null }
+                                          .padding(horizontal = 12.dp, vertical = 6.dp),
+                                      horizontalArrangement = Arrangement.SpaceBetween,
+                                      verticalAlignment = Alignment.CenterVertically
+                                  ) {
+                                      Text(
+                                          text = "Команда: $selectedTeamFilter",
+                                          color = Color.White,
+                                          fontSize = 12.sp,
+                                          fontWeight = FontWeight.Bold
+                                      )
+                                      Icon(Icons.Default.Close, contentDescription = "Сбросить", tint = KhlIceBlue, modifier = Modifier.size(16.dp))
+                                  }
+                              } else {
+                                  val groupOptions = listOf("Все") + (pageData?.standingGroups?.map { it.groupName } ?: listOf("Группа А", "Группа Б", "Группа В"))
+                                  Row(
+                                      modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 2.dp),
+                                      horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                  ) {
+                                      groupOptions.distinct().forEach { grp ->
+                                          val isSel = selectedMatchGroup == grp
+                                          Box(
+                                              modifier = Modifier
+                                                  .clip(RoundedCornerShape(8.dp))
+                                                  .background(if (isSel) KhlIceBlue.copy(alpha = 0.25f) else Color.Transparent)
+                                                  .clickable { selectedMatchGroup = grp }
+                                                  .padding(horizontal = 10.dp, vertical = 4.dp)
+                                          ) {
+                                              Text(grp, color = if (isSel) KhlIceBlue else KhlTextGray, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                          }
                                       }
                                   }
                               }
                           }
 
-                          // Шапка для вкладки Таблица
+                          // Шапка для вкладки 1 (Таблица)
                           if (bottomTab == 1) {
                               val groups = pageData?.standingGroups ?: emptyList()
                               if (groups.isNotEmpty()) {
@@ -923,7 +866,7 @@ jobs:
                               }
                           }
 
-                          // Шапка для вкладки Игроки (Номинации)
+                          // Шапка для вкладки 2 (Лидеры / Игроки)
                           if (bottomTab == 2 && playerCategories.isNotEmpty()) {
                               Row(
                                   modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 6.dp),
@@ -952,25 +895,25 @@ jobs:
                               selected = bottomTab == 0,
                               onClick = { bottomTab = 0 },
                               icon = { Icon(Icons.Default.SportsHockey, null) },
-                              label = { Text("Матчи ($totalLoadedMatches)") }
+                              label = { Text("Матчи") }
                           )
                           NavigationBarItem(
                               selected = bottomTab == 1,
                               onClick = { bottomTab = 1 },
                               icon = { Icon(Icons.Default.FormatListNumbered, null) },
-                              label = { Text("Таблица (${pageData?.standingGroups?.size ?: 0})") }
+                              label = { Text("Таблица") }
                           )
                           NavigationBarItem(
                               selected = bottomTab == 2,
                               onClick = { bottomTab = 2 },
                               icon = { Icon(Icons.Default.EmojiEvents, null) },
-                              label = { Text("Игроки (${playerCategories.size})") }
+                              label = { Text("Лидеры") }
                           )
                           NavigationBarItem(
                               selected = bottomTab == 3,
                               onClick = { bottomTab = 3 },
-                              icon = { Icon(Icons.Default.Code, null) },
-                              label = { Text("Веб / API") }
+                              icon = { Icon(Icons.Default.Groups, null) },
+                              label = { Text("Клубы (${allClubs.size})") }
                           )
                       }
                   }
@@ -981,11 +924,9 @@ jobs:
                               CircularProgressIndicator(color = KhlAccentRed)
                               Spacer(modifier = Modifier.height(12.dp))
                               Text(
-                                  text = "Загрузка всех матчей, таблиц и лидеров ФХМ...",
+                                  text = "Прямая загрузка JSON API fhmoscow.com...",
                                   color = KhlTextGray,
-                                  fontSize = 12.sp,
-                                  textAlign = TextAlign.Center,
-                                  modifier = Modifier.padding(horizontal = 24.dp)
+                                  fontSize = 12.sp
                               )
                           }
                       } else {
@@ -993,29 +934,75 @@ jobs:
                           if (data != null) {
                               when (bottomTab) {
                                   0 -> {
-                                      val baseList = if (matchFilter == 1) data.pastMatches else data.upcomingMatches
-                                      val filtered = if (selectedMatchGroup == "Все") baseList else baseList.filter { it.groupName.equals(selectedMatchGroup, ignoreCase = true) }
-                                      LiveMatchesScreen(filtered, onMatchClick = { selectedMatch = it })
+                                      val baseList = if (matchFilter == 1) pastList else upcomingList
+                                      val totalAvailable = if (matchFilter == 1) data.totalPastCount else data.totalUpcomingCount
+                                      val canLoadMore = baseList.size < totalAvailable
+
+                                      val filtered = baseList.filter { m ->
+                                          val groupOk = selectedMatchGroup == "Все" || m.groupName.equals(selectedMatchGroup, ignoreCase = true)
+                                          val teamOk = selectedTeamFilter == null ||
+                                              m.homeTeam.contains(selectedTeamFilter!!, ignoreCase = true) ||
+                                              m.awayTeam.contains(selectedTeamFilter!!, ignoreCase = true)
+                                          groupOk && teamOk
+                                      }
+
+                                      LiveMatchesScreen(
+                                          matches = filtered,
+                                          canLoadMore = canLoadMore,
+                                          isLoadingMore = isLoadingMore,
+                                          onLoadMore = { loadMoreCurrentMatches() },
+                                          onMatchClick = { selectedMatch = it }
+                                      )
                                   }
                                   1 -> {
                                       val group = data.standingGroups.getOrNull(selectedTableGroupIdx)
-                                      KhlStandingsScreen(group = group, onTeamClick = { selectedTeamRow = it })
+                                      KhlStandingsScreen(
+                                          group = group,
+                                          onTeamClick = { selectedTeamRow = it }
+                                      )
                                   }
                                   2 -> {
                                       val catKey = playerCategories.getOrNull(selectedPlayerCatIdx) ?: ""
                                       val playersList = data.playersByCategory[catKey] ?: emptyList()
-                                      KhlPlayersScreen(players = playersList, onPlayerClick = { selectedPlayer = it })
+                                      KhlPlayersScreen(
+                                          players = playersList,
+                                          onPlayerClick = { selectedPlayer = it }
+                                      )
                                   }
-                                  3 -> WebAndDomScreen(data)
+                                  3 -> {
+                                      ClubsDirectoryScreen(
+                                          clubs = allClubs,
+                                          onSelectClubMatches = { clubName ->
+                                              selectedTeamFilter = clubName
+                                              bottomTab = 0
+                                          },
+                                          onClubDetails = { selectedTeamRow = it }
+                                      )
+                                  }
                               }
                           }
                       }
                   }
               }
 
+              // Выбор турнира
               if (showTournamentPicker) {
-                  var customId by remember { mutableStateOf(tournamentId) }
-                  val quickList = listOf("54", "53", "52", "51", "50")
+                  var customId by remember { mutableStateOf(tournamentId.toString()) }
+                  val defaultTournaments = listOf(
+                      FhmTournamentOption(54, "Кубок г. Москвы 2017 г.р. (4х4)"),
+                      FhmTournamentOption(53, "Турнир ФХМ #53"),
+                      FhmTournamentOption(52, "Турнир ФХМ #52"),
+                      FhmTournamentOption(51, "Турнир ФХМ #51"),
+                      FhmTournamentOption(50, "Турнир ФХМ #50"),
+                      FhmTournamentOption(49, "Турнир ФХМ #49"),
+                      FhmTournamentOption(48, "Турнир ФХМ #48")
+                  )
+                  val options = if (!pageData?.availableTournaments.isNullOrEmpty()) {
+                      pageData!!.availableTournaments
+                  } else {
+                      defaultTournaments
+                  }
+
                   AlertDialog(
                       onDismissRequest = { showTournamentPicker = false },
                       containerColor = KhlCardDark,
@@ -1025,22 +1012,27 @@ jobs:
                               OutlinedTextField(
                                   value = customId,
                                   onValueChange = { customId = it.filter { c -> c.isDigit() } },
-                                  label = { Text("ID турнира (например, 54)") },
+                                  label = { Text("ID турнира на fhmoscow.com") },
                                   singleLine = true
                               )
-                              Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                  quickList.forEach { qId ->
+                              Text("Турниры:", color = KhlTextGray, fontSize = 12.sp)
+                              LazyColumn(
+                                  modifier = Modifier.heightIn(max = 260.dp),
+                                  verticalArrangement = Arrangement.spacedBy(6.dp)
+                              ) {
+                                  items(options) { opt ->
                                       Box(
                                           modifier = Modifier
+                                              .fillMaxWidth()
                                               .clip(RoundedCornerShape(8.dp))
-                                              .background(KhlBgDark)
+                                              .background(if (opt.id == tournamentId) KhlAccentRed else KhlBgDark)
                                               .clickable {
-                                                  tournamentId = qId
+                                                  tournamentId = opt.id
                                                   showTournamentPicker = false
                                               }
-                                              .padding(horizontal = 10.dp, vertical = 6.dp)
+                                              .padding(10.dp)
                                       ) {
-                                          Text("#$qId", color = KhlIceBlue, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                          Text("#${opt.id} — ${opt.name}", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                                       }
                                   }
                               }
@@ -1048,15 +1040,17 @@ jobs:
                       },
                       confirmButton = {
                           TextButton(onClick = {
-                              if (customId.isNotEmpty()) tournamentId = customId
+                              val parsed = customId.toIntOrNull()
+                              if (parsed != null) tournamentId = parsed
                               showTournamentPicker = false
                           }) {
-                              Text("Загрузить", color = KhlIceBlue)
+                              Text("Перейти", color = KhlIceBlue)
                           }
                       }
                   )
               }
 
+              // Досье игрока
               selectedPlayer?.let { p ->
                   AlertDialog(
                       onDismissRequest = { selectedPlayer = null },
@@ -1064,37 +1058,62 @@ jobs:
                       title = {
                           Row(verticalAlignment = Alignment.CenterVertically) {
                               AsyncImage(
-                                  model = p.photoUrl,
+                                  model = p.playerPhoto,
                                   contentDescription = p.fullName,
-                                  contentScale = ContentScale.Fit,
-                                  modifier = Modifier.size(44.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.1f)).padding(4.dp)
+                                  contentScale = ContentScale.Crop,
+                                  modifier = Modifier.size(54.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.1f))
                               )
-                              Spacer(modifier = Modifier.width(10.dp))
+                              Spacer(modifier = Modifier.width(12.dp))
                               Column {
                                   Text(p.fullName, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                                  Text("№${p.number} • ${p.roleName}", color = KhlIceBlue, fontSize = 12.sp)
+                                  val numText = if (p.number.isNotEmpty()) "№${p.number} • " else ""
+                                  Text("$numText${p.roleName}", color = KhlIceBlue, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                               }
                           }
                       },
                       text = {
-                          Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                              Text("Клуб: ${p.clubName}", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                              Text("Дата рождения: ${p.birthDate}", color = KhlTextGray, fontSize = 13.sp)
-                              Text("Номинация: ${p.categoryTitle}", color = KhlAccentRed, fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                              if (p.statSummary.isNotEmpty()) {
-                                  Text("Показатели: ${p.statSummary}", color = KhlIceBlue, fontSize = 14.sp, fontWeight = FontWeight.Black)
+                          Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                              Row(verticalAlignment = Alignment.CenterVertically) {
+                                  AsyncImage(
+                                      model = p.clubLogo,
+                                      contentDescription = p.clubName,
+                                      modifier = Modifier.size(24.dp)
+                                  )
+                                  Spacer(modifier = Modifier.width(8.dp))
+                                  Text(p.clubName, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                               }
-                              Text("JSON statistics: ${p.rawStatJson}", color = KhlTextGray, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                              Text("Дата рождения: ${p.birthDate}", color = KhlTextGray, fontSize = 13.sp)
+                              Row(
+                                  modifier = Modifier
+                                      .fillMaxWidth()
+                                      .clip(RoundedCornerShape(10.dp))
+                                      .background(KhlBgDark)
+                                      .padding(12.dp),
+                                  horizontalArrangement = Arrangement.SpaceEvenly
+                              ) {
+                                  StatMiniBox("ИГРЫ", p.games.toString())
+                                  StatMiniBox("ГОЛЫ", p.goals.toString())
+                                  StatMiniBox("ПАСЫ", p.assists.toString())
+                                  StatMiniBox("ОЧКИ", p.points.toString(), highlight = true)
+                              }
                           }
                       },
                       confirmButton = {
-                          TextButton(onClick = { selectedPlayer = null }) {
-                              Text("Закрыть", color = KhlIceBlue)
+                          Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                              TextButton(onClick = {
+                                  context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(p.playerUrl)))
+                              }) {
+                                  Text("Профиль на ФХМ", color = KhlAccentRed)
+                              }
+                              TextButton(onClick = { selectedPlayer = null }) {
+                                  Text("Закрыть", color = KhlIceBlue)
+                              }
                           }
                       }
                   )
               }
 
+              // Карточка команды
               selectedTeamRow?.let { row ->
                   AlertDialog(
                       onDismissRequest = { selectedTeamRow = null },
@@ -1105,30 +1124,54 @@ jobs:
                                   model = row.logoUrl,
                                   contentDescription = row.teamName,
                                   contentScale = ContentScale.Fit,
-                                  modifier = Modifier.size(40.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.1f)).padding(4.dp)
+                                  modifier = Modifier.size(44.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.1f)).padding(4.dp)
                               )
                               Spacer(modifier = Modifier.width(10.dp))
-                              Text("${row.position}. ${row.teamName}", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                              Column {
+                                  Text(row.teamName, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                                  Text("${row.groupName} • ${row.position} место", color = KhlIceBlue, fontSize = 12.sp)
+                              }
                           }
                       },
                       text = {
-                          Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                              Text("Очки: ${row.points}  |  Игры: ${row.games}", color = KhlIceBlue, fontSize = 15.sp, fontWeight = FontWeight.Black)
-                              Text("Победы: ${row.wins} (ОТ: ${row.otWins}) • Ничьи: ${row.ties} • Поражения: ${row.losses}", color = Color.White, fontSize = 13.sp)
-                              Text("Шайбы: ${row.pucksScored} - ${row.pucksMissed} (${if (row.pucksDiff > 0) "+${row.pucksDiff}" else row.pucksDiff})", color = Color.White, fontSize = 13.sp)
+                          Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                              Row(
+                                  modifier = Modifier
+                                      .fillMaxWidth()
+                                      .clip(RoundedCornerShape(10.dp))
+                                      .background(KhlBgDark)
+                                      .padding(12.dp),
+                                  horizontalArrangement = Arrangement.SpaceEvenly
+                              ) {
+                                  StatMiniBox("ИГРЫ", row.games.toString())
+                                  StatMiniBox("ПОБЕДЫ", row.wins.toString())
+                                  StatMiniBox("ШАЙБЫ", "${row.pucksScored}-${row.pucksMissed}")
+                                  StatMiniBox("ОЧКИ", row.points.toString(), highlight = true)
+                              }
                               if (row.tieBreakNote.isNotEmpty()) {
                                   Text(row.tieBreakNote, color = KhlTextGray, fontSize = 12.sp)
                               }
                           }
                       },
                       confirmButton = {
-                          TextButton(onClick = { selectedTeamRow = null }) {
-                              Text("Закрыть", color = KhlIceBlue)
+                          Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                              TextButton(onClick = {
+                                  val cleanName = row.teamName
+                                  selectedTeamRow = null
+                                  selectedTeamFilter = cleanName
+                                  bottomTab = 0
+                              }) {
+                                  Text("Матчи команды", color = KhlAccentRed, fontWeight = FontWeight.Bold)
+                              }
+                              TextButton(onClick = { selectedTeamRow = null }) {
+                                  Text("Закрыть", color = KhlIceBlue)
+                              }
                           }
                       }
                   )
               }
 
+              // Протокол матча
               selectedMatch?.let { match ->
                   AlertDialog(
                       onDismissRequest = { selectedMatch = null },
@@ -1136,17 +1179,38 @@ jobs:
                       title = { Text("${match.homeTeam} — ${match.awayTeam}", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold) },
                       text = {
                           Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                              Text("Счет: ${match.scoreText}", color = KhlIceBlue, fontSize = 16.sp, fontWeight = FontWeight.Black)
+                              Text("Счет: ${match.scoreText}", color = KhlIceBlue, fontSize = 20.sp, fontWeight = FontWeight.Black)
                               Text("${match.groupName} • ${match.tourName}", color = KhlAccentRed, fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                              Text("Дата: ${match.dateText}", color = Color.White, fontSize = 13.sp)
-                              Text("Протокол: ${match.gameUrl}", color = KhlTextGray, fontSize = 11.sp)
+                              Text("Дата и время: ${match.dateText}", color = Color.White, fontSize = 13.sp)
                           }
                       },
                       confirmButton = {
-                          TextButton(onClick = { selectedMatch = null }) {
-                              Text("Закрыть", color = KhlIceBlue)
+                          Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                              TextButton(onClick = {
+                                  context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(match.gameUrl)))
+                              }) {
+                                  Icon(Icons.Default.OpenInBrowser, contentDescription = null, tint = KhlAccentRed, modifier = Modifier.size(16.dp))
+                                  Spacer(modifier = Modifier.width(4.dp))
+                                  Text("Протокол на ФХМ", color = KhlAccentRed)
+                              }
+                              TextButton(onClick = { selectedMatch = null }) {
+                                  Text("Закрыть", color = KhlIceBlue)
+                              }
                           }
                       }
+                  )
+              }
+          }
+
+          @Composable
+          fun StatMiniBox(label: String, value: String, highlight: Boolean = false) {
+              Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                  Text(label, color = if (highlight) KhlAccentRed else KhlTextGray, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                  Text(
+                      text = value,
+                      color = if (highlight) KhlIceBlue else Color.White,
+                      fontSize = 16.sp,
+                      fontWeight = FontWeight.Black
                   )
               }
           }
@@ -1171,7 +1235,7 @@ jobs:
                           modifier = Modifier.fillMaxWidth().clickable { onPlayerClick(p) }
                       ) {
                           Row(
-                              modifier = Modifier.fillMaxWidth().padding(14.dp),
+                              modifier = Modifier.fillMaxWidth().padding(12.dp),
                               verticalAlignment = Alignment.CenterVertically,
                               horizontalArrangement = Arrangement.SpaceBetween
                           ) {
@@ -1183,18 +1247,17 @@ jobs:
                                       text = "${p.rank}",
                                       color = if (p.rank <= 3) KhlAccentRed else KhlTextGray,
                                       fontWeight = FontWeight.Black,
-                                      fontSize = 16.sp,
-                                      modifier = Modifier.width(26.dp)
+                                      fontSize = 15.sp,
+                                      modifier = Modifier.width(24.dp)
                                   )
                                   AsyncImage(
-                                      model = p.clubLogo,
-                                      contentDescription = p.clubName,
-                                      contentScale = ContentScale.Fit,
+                                      model = p.playerPhoto,
+                                      contentDescription = p.fullName,
+                                      contentScale = ContentScale.Crop,
                                       modifier = Modifier
-                                          .size(38.dp)
+                                          .size(42.dp)
                                           .clip(CircleShape)
                                           .background(Color.White.copy(alpha = 0.08f))
-                                          .padding(4.dp)
                                   )
                                   Spacer(modifier = Modifier.width(10.dp))
                                   Column(modifier = Modifier.weight(1f)) {
@@ -1220,35 +1283,82 @@ jobs:
                                       Text(
                                           text = "${p.clubName} • ${p.roleName}",
                                           color = KhlTextGray,
-                                          fontSize = 12.sp,
+                                          fontSize = 11.sp,
                                           maxLines = 1,
                                           overflow = TextOverflow.Ellipsis
                                       )
-                                      if (p.statSummary.isNotEmpty()) {
-                                          Text(
-                                              text = p.statSummary,
-                                              color = KhlIceBlue,
-                                              fontSize = 11.sp,
-                                              fontWeight = FontWeight.SemiBold
-                                          )
-                                      }
                                   }
                               }
 
-                              if (p.mainValue.isNotEmpty()) {
+                              // Колонки И | Г | П | ОЧКИ как в КХЛ
+                              Row(
+                                  horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                  verticalAlignment = Alignment.CenterVertically
+                              ) {
+                                  Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                      Text("И", color = KhlTextGray, fontSize = 10.sp)
+                                      Text("${p.games}", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                  }
+                                  Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                      Text("Г", color = KhlTextGray, fontSize = 10.sp)
+                                      Text("${p.goals}", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                  }
+                                  Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                      Text("П", color = KhlTextGray, fontSize = 10.sp)
+                                      Text("${p.assists}", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                  }
                                   Box(
                                       modifier = Modifier
                                           .clip(RoundedCornerShape(8.dp))
                                           .background(KhlBgDark)
-                                          .padding(horizontal = 12.dp, vertical = 6.dp)
+                                          .padding(horizontal = 10.dp, vertical = 4.dp),
+                                      contentAlignment = Alignment.Center
                                   ) {
-                                      Text(
-                                          text = p.mainValue,
-                                          color = KhlIceBlue,
-                                          fontWeight = FontWeight.Black,
-                                          fontSize = 18.sp
-                                      )
+                                      Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                          Text(p.mainStatLabel, color = KhlAccentRed, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                                          Text(p.mainStatValue, color = KhlIceBlue, fontSize = 15.sp, fontWeight = FontWeight.Black)
+                                      }
                                   }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun ClubsDirectoryScreen(
+              clubs: List<StandingRow>,
+              onSelectClubMatches: (String) -> Unit,
+              onClubDetails: (StandingRow) -> Unit
+          ) {
+              LazyColumn(contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                  items(clubs) { club ->
+                      Card(
+                          colors = CardDefaults.cardColors(containerColor = KhlCardDark),
+                          shape = RoundedCornerShape(12.dp),
+                          modifier = Modifier.fillMaxWidth().clickable { onClubDetails(club) }
+                      ) {
+                          Row(
+                              modifier = Modifier.fillMaxWidth().padding(12.dp),
+                              verticalAlignment = Alignment.CenterVertically,
+                              horizontalArrangement = Arrangement.SpaceBetween
+                          ) {
+                              Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+                                  AsyncImage(
+                                      model = club.logoUrl,
+                                      contentDescription = club.teamName,
+                                      contentScale = ContentScale.Fit,
+                                      modifier = Modifier.size(38.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.08f)).padding(4.dp)
+                                  )
+                                  Spacer(modifier = Modifier.width(10.dp))
+                                  Column {
+                                      Text(club.teamName, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                      Text("${club.groupName} • Место: ${club.position} • Очки: ${club.points}", color = KhlTextGray, fontSize = 12.sp)
+                                  }
+                              }
+                              TextButton(onClick = { onSelectClubMatches(club.teamName) }) {
+                                  Text("Матчи ->", color = KhlIceBlue, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                               }
                           }
                       }
@@ -1329,10 +1439,27 @@ jobs:
           }
 
           @Composable
-          fun LiveMatchesScreen(matches: List<HockeyMatch>, onMatchClick: (HockeyMatch) -> Unit) {
+          fun LiveMatchesScreen(
+              matches: List<HockeyMatch>,
+              canLoadMore: Boolean,
+              isLoadingMore: Boolean,
+              onLoadMore: () -> Unit,
+              onMatchClick: (HockeyMatch) -> Unit
+          ) {
               if (matches.isEmpty()) {
                   Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-                      Text("Матчей для выбранного фильтра нет.", color = KhlTextGray, fontSize = 14.sp)
+                      Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                          Text("В загруженных турах матчей для этого фильтра нет.", color = KhlTextGray, fontSize = 14.sp, textAlign = TextAlign.Center)
+                          if (canLoadMore) {
+                              Spacer(modifier = Modifier.height(12.dp))
+                              Button(
+                                  onClick = onLoadMore,
+                                  colors = ButtonDefaults.buttonColors(containerColor = KhlAccentRed)
+                              ) {
+                                  Text(if (isLoadingMore) "Загрузка..." else "Загрузить еще матчи (+24)")
+                              }
+                          }
+                      }
                   }
                   return
               }
@@ -1380,59 +1507,20 @@ jobs:
                           }
                       }
                   }
-              }
-          }
 
-          @SuppressLint("SetJavaScriptEnabled")
-          @Composable
-          fun WebAndDomScreen(data: TournamentPageData) {
-              val context = LocalContext.current
-              var showLiveWeb by remember { mutableStateOf(false) }
-
-              Column(modifier = Modifier.fillMaxSize()) {
-                  Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                      Button(
-                          onClick = {
-                              val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                              clipboard.setPrimaryClip(ClipData.newPlainText("FHM_V31", data.diagnosticReport))
-                              Toast.makeText(context, "Скопировано!", Toast.LENGTH_LONG).show()
-                          },
-                          colors = ButtonDefaults.buttonColors(containerColor = KhlAccentRed),
-                          modifier = Modifier.weight(1f)
-                      ) {
-                          Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
-                          Spacer(modifier = Modifier.width(6.dp))
-                          Text("Скопировать API", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                      }
-                      Button(
-                          onClick = { showLiveWeb = !showLiveWeb },
-                          colors = ButtonDefaults.buttonColors(containerColor = KhlCardDark),
-                          modifier = Modifier.weight(1f)
-                      ) {
-                          Icon(Icons.Default.Public, contentDescription = null, modifier = Modifier.size(16.dp), tint = KhlIceBlue)
-                          Spacer(modifier = Modifier.width(6.dp))
-                          Text(if (showLiveWeb) "Показать отчет" else "Открыть веб-вид", color = KhlIceBlue, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                      }
-                  }
-
-                  if (showLiveWeb) {
-                      AndroidView(
-                          modifier = Modifier.fillMaxSize(),
-                          factory = { ctx ->
-                              WebView(ctx).apply {
-                                  settings.javaScriptEnabled = true
-                                  settings.domStorageEnabled = true
-                                  webViewClient = WebViewClient()
-                                  loadUrl(data.url)
-                              }
-                          }
-                      )
-                  } else {
-                      LazyColumn(contentPadding = PaddingValues(12.dp), modifier = Modifier.fillMaxSize()) {
-                          item {
-                              Card(colors = CardDefaults.cardColors(containerColor = KhlCardDark), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
-                                  Text(data.diagnosticReport, color = Color.White, fontSize = 11.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.padding(12.dp))
-                              }
+                  if (canLoadMore) {
+                      item {
+                          Button(
+                              onClick = onLoadMore,
+                              enabled = !isLoadingMore,
+                              colors = ButtonDefaults.buttonColors(containerColor = KhlAccentRed),
+                              modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+                          ) {
+                              Text(
+                                  text = if (isLoadingMore) "Подгружаем туры..." else "Загрузить еще матчи (+24)",
+                                  color = Color.White,
+                                  fontWeight = FontWeight.Bold
+                              )
                           }
                       }
                   }
@@ -1451,11 +1539,11 @@ jobs:
             exit 1
           }
 
-      - name: Rename APK to v3.1
-        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/fhm-khl-v31.apk
+      - name: Rename APK to v4.0
+        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/fhm-khl-v40.apk
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fhm-khl-v31
-          path: app/build/outputs/apk/debug/fhm-khl-v31.apk
+          name: fhm-khl-v40
+          path: app/build/outputs/apk/debug/fhm-khl-v40.apk
